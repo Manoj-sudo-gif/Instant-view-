@@ -1,0 +1,6 @@
+{
+  "name": "Instant View",
+  "description": "Internal inventory and reporting software with Wondersoft Excel data mapping, Stock Report dashboard, Sales Report, store-wise stock tracking, and automated exports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
