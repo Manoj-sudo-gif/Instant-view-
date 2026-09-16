@@ -9,6 +9,8 @@ import {
   ChevronUp,
   Boxes,
   Store,
+  Shuffle,
+  RotateCcw,
 } from 'lucide-react';
 import {
   MappedInventoryItem,
@@ -25,6 +27,11 @@ import {
   compareSizes,
   compareToonColourAndSize,
 } from '../utils/excelParser';
+import {
+  shuffleMatrixData,
+  ShuffledMatrixRow,
+  MatrixStoreKey,
+} from '../utils/stockShuffle';
 import { StoreStockCards } from './StoreStockCards';
 
 interface RoughViewTableProps {
@@ -158,10 +165,12 @@ export function RoughViewTable({
   const [sortAsc, setSortAsc] = useState(searchState.type === 'TOON' ? true : false);
   const [viewMode, setViewMode] = useState<'table' | 'matrix'>('table');
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
+  const [isShuffled, setIsShuffled] = useState(false);
 
   // Sync sort when search type or query changes:
   // TOON searches automatically prioritize 1st: Toon Label (asc), 2nd: Colour (asc), 3rd: Size (32, 34, 36... or S, M, L...)
   useEffect(() => {
+    setIsShuffled(false);
     if (searchState.type === 'TOON') {
       setSortField('toonLabel');
       setSortAsc(true);
@@ -307,6 +316,11 @@ export function RoughViewTable({
     return generateToonLabelMatrix(filteredItems);
   }, [filteredItems, searchState.type, viewMode]);
 
+  // Pre-calculate shuffled matrix data with stock redistribution
+  const shuffledResult = useMemo(() => {
+    return shuffleMatrixData(matrixData);
+  }, [matrixData]);
+
   // Group matrixData by (toonLabel, colour) so repeated colors (e.g. 10 sizes of Blue) are visually merged
   const matrixGroups = useMemo(() => {
     const groups: {
@@ -345,6 +359,7 @@ export function RoughViewTable({
     return map;
   }, [matrixGroups]);
 
+  // Totals for original store matrix
   const matrixTotals = useMemo(() => {
     return matrixData.reduce(
       (acc, r) => {
@@ -372,6 +387,85 @@ export function RoughViewTable({
       }
     );
   }, [matrixData]);
+
+  // Totals for shuffled store matrix
+  const shuffledTotals = useMemo(() => {
+    return shuffledResult.shuffledRows.reduce(
+      (acc, r) => {
+        acc.kootapalli += r.kootapalli;
+        acc.karur += r.karur;
+        acc.salem += r.salem;
+        acc.namakkal += r.namakkal;
+        acc.kumbakonam += r.kumbakonam;
+        acc.thiruvannamalai += r.thiruvannamalai;
+        acc.mallur += r.mallur;
+        acc.gmFashionsWarehouse += r.gmFashionsWarehouse;
+        acc.sizeTotal += r.sizeTotal;
+        return acc;
+      },
+      {
+        kootapalli: 0,
+        karur: 0,
+        salem: 0,
+        namakkal: 0,
+        kumbakonam: 0,
+        thiruvannamalai: 0,
+        mallur: 0,
+        gmFashionsWarehouse: 0,
+        sizeTotal: 0,
+      }
+    );
+  }, [shuffledResult.shuffledRows]);
+
+  // Helper to render cell in the Shuffled Matrix with clear distinction for borrowed / donated / untouched
+  const renderShuffledMatrixCell = (
+    storeKey: MatrixStoreKey,
+    shuffledRow: ShuffledMatrixRow
+  ) => {
+    const cellInfo = shuffledRow.cellInfo[storeKey];
+
+    // 1. If stock was 0 and borrowed (redirected) from another store
+    if (cellInfo.isRedirected) {
+      return (
+        <span
+          className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-purple-100/90 text-purple-900 font-extrabold border-2 border-purple-400 shadow-xs ring-1 ring-purple-300"
+          title={`Borrowed 1 unit from ${cellInfo.sourceStoreName} (${cellInfo.sourceShortcut})`}
+        >
+          <span className="text-xs text-purple-950">{cellInfo.shuffledQty}</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-700 text-white font-black uppercase tracking-wide shadow-2xs">
+            {cellInfo.sourceShortcut}
+          </span>
+        </span>
+      );
+    }
+
+    // 2. If this store donated (lent) stock to a 0-stock store
+    if (cellInfo.donatedCount > 0) {
+      return (
+        <span
+          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-50/80 text-slate-800 font-bold border border-amber-300"
+          title={`Lent ${cellInfo.donatedCount} unit(s) to 0-stock store(s)`}
+        >
+          <span className="text-emerald-700">{cellInfo.shuffledQty}</span>
+          <span className="text-[9.5px] font-bold text-amber-700 bg-amber-100 px-1 py-0.2 rounded">
+            (-{cellInfo.donatedCount})
+          </span>
+        </span>
+      );
+    }
+
+    // 3. Regular store with existing stock (untouched)
+    if (cellInfo.shuffledQty > 0) {
+      return (
+        <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+          {cellInfo.shuffledQty}
+        </span>
+      );
+    }
+
+    // 4. Store remains 0
+    return <span className="text-slate-300">0</span>;
+  };
 
   const getColourBadgeClass = (colour: string) => {
     const c = (colour || '').toUpperCase().trim();
@@ -846,180 +940,383 @@ export function RoughViewTable({
 
       {/* VIEW 2: TOON LABEL STORE MATRIX */}
       {viewMode === 'matrix' && (
-        <div
-          id="toon-matrix-table-wrapper"
-          className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs"
-        >
-          <table
-            id="toon-matrix-table"
-            className="w-full text-left text-xs border-collapse"
-          >
-            <thead>
-              <tr className="bg-slate-50 text-slate-500 font-bold uppercase text-[11px] tracking-wider border-b border-slate-200">
-                <th className="px-3.5 py-3">Color</th>
-                <th className="px-3.5 py-3 font-mono">Toon Label</th>
-                <th className="px-3.5 py-3 text-center">Size</th>
-                <th className="px-3.5 py-3 text-right">Kootapalli</th>
-                <th className="px-3.5 py-3 text-right">Karur</th>
-                <th className="px-3.5 py-3 text-right">Salem</th>
-                <th className="px-3.5 py-3 text-right">Namakkal</th>
-                <th className="px-3.5 py-3 text-right">Kumbakonam</th>
-                <th className="px-3.5 py-3 text-right">Thiruvannamalai</th>
-                <th className="px-3.5 py-3 text-right">Mallur</th>
-                <th className="px-3.5 py-3 text-right">GM Fashions WH</th>
-                <th className="px-3.5 py-3 text-right font-bold text-indigo-700 bg-indigo-50/70">
-                  Size Total
-                </th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 text-xs text-slate-700">
-              {matrixData.length === 0 ? (
-                <tr>
-                  <td colSpan={12} className="py-8 text-center text-slate-400">
-                    No matrix data available.
-                  </td>
-                </tr>
-              ) : (
-                matrixData.map((row, idx) => {
-                  const gInfo = groupInfoMap.get(idx);
-                  const isFirst = gInfo ? gInfo.isFirst : true;
-                  const count = gInfo ? gInfo.count : 1;
+        <div className="space-y-6">
+          {/* 1. ORIGINAL STORE MATRIX (Always visible in Matrix mode) */}
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between gap-3 px-1">
+              <div className="flex items-center gap-2">
+                <span className="inline-block w-2.5 h-2.5 rounded-full bg-indigo-600"></span>
+                <h3 className="text-sm font-bold text-slate-800 tracking-tight">
+                  Original Store Matrix
+                </h3>
+                <span className="text-[11px] text-slate-500 font-medium">
+                  (Actual live inventory across all stores)
+                </span>
+              </div>
+              <div className="text-xs text-slate-500 font-medium">
+                Total Rows: <span className="font-bold text-slate-800">{matrixData.length}</span>
+              </div>
+            </div>
 
-                  return (
-                    <tr
-                      key={`matrix-${idx}`}
-                      className={`hover:bg-slate-50 transition-colors ${
-                        isFirst && idx > 0 ? 'border-t-2 border-slate-200' : ''
-                      }`}
-                    >
-                      {isFirst && (
-                        <td
-                          rowSpan={count}
-                          className="px-3.5 py-3 text-center align-middle border-r border-slate-200 bg-white font-medium"
-                        >
-                          <span
-                            className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-bold border shadow-2xs ${getColourBadgeClass(
-                              row.colour
-                            )}`}
-                          >
-                            {row.colour}
-                          </span>
-                        </td>
-                      )}
-                      {isFirst && (
-                        <td
-                          rowSpan={count}
-                          className="px-3.5 py-3 text-center align-middle font-mono font-bold text-indigo-700 bg-indigo-50/30 border-r border-slate-200"
-                        >
-                          {row.toonLabel}
-                        </td>
-                      )}
-                      <td className="px-3.5 py-2.5 text-center font-mono font-bold text-slate-800 border-r border-slate-100">
-                        <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200">
-                          {row.size}
-                        </span>
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.kootapalli > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.kootapalli}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.karur > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.karur}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.salem > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.salem}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.namakkal > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.namakkal}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.kumbakonam > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.kumbakonam}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.thiruvannamalai > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.thiruvannamalai}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.mallur > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.mallur}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono">
-                        {row.gmFashionsWarehouse > 0 ? (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                            {row.gmFashionsWarehouse}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300">0</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right font-mono font-bold text-indigo-700 bg-indigo-50/50">
-                        {row.sizeTotal}
+            <div
+              id="toon-matrix-table-wrapper"
+              className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-xs"
+            >
+              <table
+                id="toon-matrix-table"
+                className="w-full text-left text-xs border-collapse"
+              >
+                <thead>
+                  <tr className="bg-slate-50 text-slate-500 font-bold uppercase text-[11px] tracking-wider border-b border-slate-200">
+                    <th className="px-3.5 py-3">Color</th>
+                    <th className="px-3.5 py-3 font-mono">Toon Label</th>
+                    <th className="px-3.5 py-3 text-center">Size</th>
+                    <th className="px-3.5 py-3 text-right">Kootapalli</th>
+                    <th className="px-3.5 py-3 text-right">Karur</th>
+                    <th className="px-3.5 py-3 text-right">Salem</th>
+                    <th className="px-3.5 py-3 text-right">Namakkal</th>
+                    <th className="px-3.5 py-3 text-right">Kumbakonam</th>
+                    <th className="px-3.5 py-3 text-right">Thiruvannamalai</th>
+                    <th className="px-3.5 py-3 text-right">Mallur</th>
+                    <th className="px-3.5 py-3 text-right">GM Fashions WH</th>
+                    <th className="px-3.5 py-3 text-right font-bold text-indigo-700 bg-indigo-50/70">
+                      Size Total
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-xs text-slate-700">
+                  {matrixData.length === 0 ? (
+                    <tr>
+                      <td colSpan={12} className="py-8 text-center text-slate-400">
+                        No matrix data available.
                       </td>
                     </tr>
-                  );
-                })
+                  ) : (
+                    matrixData.map((row, idx) => {
+                      const gInfo = groupInfoMap.get(idx);
+                      const isFirst = gInfo ? gInfo.isFirst : true;
+                      const count = gInfo ? gInfo.count : 1;
+
+                      return (
+                        <tr
+                          key={`orig-matrix-${idx}`}
+                          className={`hover:bg-slate-50 transition-colors ${
+                            isFirst && idx > 0 ? 'border-t-2 border-slate-200' : ''
+                          }`}
+                        >
+                          {isFirst && (
+                            <td
+                              rowSpan={count}
+                              className="px-3.5 py-3 text-center align-middle border-r border-slate-200 bg-white font-medium"
+                            >
+                              <span
+                                className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-bold border shadow-2xs ${getColourBadgeClass(
+                                  row.colour
+                                )}`}
+                              >
+                                {row.colour}
+                              </span>
+                            </td>
+                          )}
+                          {isFirst && (
+                            <td
+                              rowSpan={count}
+                              className="px-3.5 py-3 text-center align-middle font-mono font-bold text-indigo-700 bg-indigo-50/30 border-r border-slate-200"
+                            >
+                              {row.toonLabel}
+                            </td>
+                          )}
+                          <td className="px-3.5 py-2.5 text-center font-mono font-bold text-slate-800 border-r border-slate-100">
+                            <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200">
+                              {row.size}
+                            </span>
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.kootapalli > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.kootapalli}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.karur > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.karur}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.salem > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.salem}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.namakkal > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.namakkal}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.kumbakonam > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.kumbakonam}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.thiruvannamalai > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.thiruvannamalai}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.mallur > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.mallur}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {row.gmFashionsWarehouse > 0 ? (
+                              <span className="inline-block px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                                {row.gmFashionsWarehouse}
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">0</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono font-bold text-indigo-700 bg-indigo-50/50">
+                            {row.sizeTotal}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+                {matrixData.length > 0 && (
+                  <tfoot className="bg-amber-50/70 border-t-2 border-slate-300 font-bold text-xs text-slate-900">
+                    <tr>
+                      <td className="px-3.5 py-3 uppercase tracking-wider font-extrabold text-amber-900">
+                        TOTAL
+                      </td>
+                      <td className="px-3.5 py-3 text-center text-slate-400 font-mono">-</td>
+                      <td className="px-3.5 py-3 text-center text-slate-400 font-mono">-</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.kootapalli}</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.karur}</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.salem}</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.namakkal}</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.kumbakonam}</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.thiruvannamalai}</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.mallur}</td>
+                      <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.gmFashionsWarehouse}</td>
+                      <td className="px-3.5 py-3 text-right font-mono font-black text-amber-950 bg-amber-100/80">
+                        {matrixTotals.sizeTotal}
+                      </td>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            </div>
+          </div>
+
+          {/* 2. SHUFFLE BUTTON ONLY (Directly below Store Matrix) */}
+          {matrixData.length > 0 && (
+            <div
+              id="matrix-shuffle-panel"
+              className="flex flex-wrap items-center justify-between gap-3 py-2 px-1"
+            >
+              <div>
+                {!isShuffled ? (
+                  <button
+                    type="button"
+                    id="btn-shuffle-stocks"
+                    onClick={() => setIsShuffled(true)}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white font-bold text-sm shadow-md transition-all cursor-pointer"
+                  >
+                    <Shuffle className="w-4 h-4" />
+                    <span>Shuffle</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    id="btn-reset-shuffle"
+                    onClick={() => setIsShuffled(false)}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-white hover:bg-slate-100 active:scale-95 text-slate-700 font-bold text-sm border border-slate-300 shadow-xs transition-all cursor-pointer"
+                  >
+                    <RotateCcw className="w-4 h-4 text-slate-500" />
+                    <span>Hide Shuffled Matrix</span>
+                  </button>
+                )}
+              </div>
+
+              {isShuffled && (
+                <div className="flex items-center gap-2 text-xs font-semibold text-purple-900 bg-purple-50 border border-purple-200 px-3 py-1.5 rounded-lg">
+                  <span className="inline-block w-2 h-2 rounded-full bg-purple-600"></span>
+                  <span>Shuffled Matrix Active ({shuffledResult.totalRedirectedUnits} units borrowed)</span>
+                </div>
               )}
-            </tbody>
-            {matrixData.length > 0 && (
-              <tfoot className="bg-amber-50/70 border-t-2 border-slate-300 font-bold text-xs text-slate-900">
-                <tr>
-                  <td className="px-3.5 py-3 uppercase tracking-wider font-extrabold text-amber-900">TOTAL</td>
-                  <td className="px-3.5 py-3 text-center text-slate-400 font-mono">-</td>
-                  <td className="px-3.5 py-3 text-center text-slate-400 font-mono">-</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.kootapalli}</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.karur}</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.salem}</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.namakkal}</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.kumbakonam}</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.thiruvannamalai}</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.mallur}</td>
-                  <td className="px-3.5 py-3 text-right font-mono">{matrixTotals.gmFashionsWarehouse}</td>
-                  <td className="px-3.5 py-3 text-right font-mono font-black text-amber-950 bg-amber-100/80">
-                    {matrixTotals.sizeTotal}
-                  </td>
-                </tr>
-              </tfoot>
-            )}
-          </table>
+            </div>
+          )}
+
+          {/* 3. SHUFFLED MATRIX (Visible below when Shuffle is clicked) */}
+          {isShuffled && matrixData.length > 0 && (
+            <div id="shuffled-matrix-section" className="space-y-2.5 pt-2 border-t-2 border-dashed border-purple-200">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-1">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-3 h-3 rounded-full bg-purple-600 animate-pulse"></span>
+                  <h3 className="text-sm font-extrabold text-purple-900 tracking-tight flex items-center gap-2">
+                    <span>Shuffled Store Matrix</span>
+                    <span className="text-xs px-2.5 py-0.5 rounded-full bg-purple-100 text-purple-800 border border-purple-300 font-bold">
+                      Stock Balanced
+                    </span>
+                  </h3>
+                </div>
+                <div className="text-xs text-purple-800 font-medium">
+                  Borrowed stock highlighted in <strong className="text-purple-950 bg-purple-100 px-1.5 py-0.5 rounded border border-purple-300">Purple with Store Code (e.g., 1 KR, 1 KP, 1 MLR)</strong>
+                </div>
+              </div>
+
+              <div
+                id="shuffled-toon-matrix-table-wrapper"
+                className="overflow-x-auto rounded-xl border-2 border-purple-300 bg-white shadow-md ring-1 ring-purple-100"
+              >
+                <table
+                  id="shuffled-toon-matrix-table"
+                  className="w-full text-left text-xs border-collapse"
+                >
+                  <thead>
+                    <tr className="bg-gradient-to-r from-purple-50 via-indigo-50/50 to-purple-50 text-purple-900 font-bold uppercase text-[11px] tracking-wider border-b border-purple-200">
+                      <th className="px-3.5 py-3">Color</th>
+                      <th className="px-3.5 py-3 font-mono">Toon Label</th>
+                      <th className="px-3.5 py-3 text-center">Size</th>
+                      <th className="px-3.5 py-3 text-right">Kootapalli</th>
+                      <th className="px-3.5 py-3 text-right">Karur</th>
+                      <th className="px-3.5 py-3 text-right">Salem</th>
+                      <th className="px-3.5 py-3 text-right">Namakkal</th>
+                      <th className="px-3.5 py-3 text-right">Kumbakonam</th>
+                      <th className="px-3.5 py-3 text-right">Thiruvannamalai</th>
+                      <th className="px-3.5 py-3 text-right">Mallur</th>
+                      <th className="px-3.5 py-3 text-right">GM Fashions WH</th>
+                      <th className="px-3.5 py-3 text-right font-bold text-purple-900 bg-purple-100/80">
+                        Size Total
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-purple-100 text-xs text-slate-700">
+                    {shuffledResult.shuffledRows.map((row, idx) => {
+                      const gInfo = groupInfoMap.get(idx);
+                      const isFirst = gInfo ? gInfo.isFirst : true;
+                      const count = gInfo ? gInfo.count : 1;
+
+                      return (
+                        <tr
+                          key={`shuffled-matrix-${idx}`}
+                          className={`hover:bg-purple-50/30 transition-colors ${
+                            isFirst && idx > 0 ? 'border-t-2 border-purple-200' : ''
+                          }`}
+                        >
+                          {isFirst && (
+                            <td
+                              rowSpan={count}
+                              className="px-3.5 py-3 text-center align-middle border-r border-purple-100 bg-white font-medium"
+                            >
+                              <span
+                                className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-bold border shadow-2xs ${getColourBadgeClass(
+                                  row.colour
+                                )}`}
+                              >
+                                {row.colour}
+                              </span>
+                            </td>
+                          )}
+                          {isFirst && (
+                            <td
+                              rowSpan={count}
+                              className="px-3.5 py-3 text-center align-middle font-mono font-bold text-purple-900 bg-purple-50/40 border-r border-purple-100"
+                            >
+                              {row.toonLabel}
+                            </td>
+                          )}
+                          <td className="px-3.5 py-2.5 text-center font-mono font-bold text-slate-800 border-r border-purple-100">
+                            <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200">
+                              {row.size}
+                            </span>
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('kootapalli', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('karur', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('salem', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('namakkal', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('kumbakonam', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('thiruvannamalai', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('mallur', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono">
+                            {renderShuffledMatrixCell('gmFashionsWarehouse', row)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono font-bold text-purple-900 bg-purple-50/70">
+                            {row.sizeTotal}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  {shuffledResult.shuffledRows.length > 0 && (
+                    <tfoot className="bg-purple-100/70 border-t-2 border-purple-300 font-bold text-xs text-purple-950">
+                      <tr>
+                        <td className="px-3.5 py-3 uppercase tracking-wider font-black text-purple-950">
+                          SHUFFLED TOTAL
+                        </td>
+                        <td className="px-3.5 py-3 text-center text-purple-400 font-mono">-</td>
+                        <td className="px-3.5 py-3 text-center text-purple-400 font-mono">-</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.kootapalli}</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.karur}</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.salem}</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.namakkal}</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.kumbakonam}</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.thiruvannamalai}</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.mallur}</td>
+                        <td className="px-3.5 py-3 text-right font-mono">{shuffledTotals.gmFashionsWarehouse}</td>
+                        <td className="px-3.5 py-3 text-right font-mono font-black text-purple-950 bg-purple-200/90">
+                          {shuffledTotals.sizeTotal}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  )}
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
