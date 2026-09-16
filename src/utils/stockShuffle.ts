@@ -42,21 +42,21 @@ export const STORE_FULL_NAMES: Record<MatrixStoreKey, string> = {
 };
 
 // User's exact preference order for receiving stock when at 0:
-// 1st preference mallur,
-// 2nd tiruvannamalai,
-// 3rd kumbakonam,
-// 4th karur,
-// 5th salem,
-// 6th namakal,
-// 7th koottapalli
+// 1st preference Koottappalli (kootapalli fill agurathula first preference ah eduthuko)
+// 2nd Salem (first salem fill aganum)
+// 3rd Namakkal (apro namakkal fill aganum)
+// 4th Karur (apro karur fill aganum)
+// 5th Thiruvannamalai (apro thiruvannamalai fill aganum)
+// 6th Kumbakonam (apro kumbakonam fill aganum)
+// 7th Mallur (apr final ah mallur fill aganum)
 export const RECIPIENT_PREFERENCE: MatrixStoreKey[] = [
-  'mallur',
-  'thiruvannamalai',
-  'kumbakonam',
-  'karur',
+  'kootapalli',
   'salem',
   'namakkal',
-  'kootapalli',
+  'karur',
+  'thiruvannamalai',
+  'kumbakonam',
+  'mallur',
 ];
 
 export interface StoreCellShuffleInfo {
