@@ -59,6 +59,13 @@ export const RECIPIENT_PREFERENCE: MatrixStoreKey[] = [
   'mallur',
 ];
 
+export interface BorrowDetail {
+  sourceStoreKey: MatrixStoreKey;
+  sourceShortcut: string;
+  sourceStoreName: string;
+  qty: number;
+}
+
 export interface StoreCellShuffleInfo {
   originalQty: number;
   shuffledQty: number;
@@ -67,11 +74,14 @@ export interface StoreCellShuffleInfo {
   sourceShortcut?: string;
   sourceStoreName?: string;
   donatedCount: number;
+  borrowedDetails: BorrowDetail[];
+  donatedToStores: { storeKey: MatrixStoreKey; shortcut: string; name: string }[];
 }
 
 export interface ShuffledMatrixRow extends ToonMatrixRow {
   cellInfo: Record<MatrixStoreKey, StoreCellShuffleInfo>;
   totalRedirectedInRow: number;
+  originalRow: ToonMatrixRow;
 }
 
 /**
@@ -100,14 +110,14 @@ export function shuffleMatrixRow(row: ToonMatrixRow): ShuffledMatrixRow {
   };
 
   const cellInfo: Record<MatrixStoreKey, StoreCellShuffleInfo> = {
-    mallur: { originalQty: row.mallur, shuffledQty: row.mallur, isRedirected: false, donatedCount: 0 },
-    thiruvannamalai: { originalQty: row.thiruvannamalai, shuffledQty: row.thiruvannamalai, isRedirected: false, donatedCount: 0 },
-    kumbakonam: { originalQty: row.kumbakonam, shuffledQty: row.kumbakonam, isRedirected: false, donatedCount: 0 },
-    karur: { originalQty: row.karur, shuffledQty: row.karur, isRedirected: false, donatedCount: 0 },
-    salem: { originalQty: row.salem, shuffledQty: row.salem, isRedirected: false, donatedCount: 0 },
-    namakkal: { originalQty: row.namakkal, shuffledQty: row.namakkal, isRedirected: false, donatedCount: 0 },
-    kootapalli: { originalQty: row.kootapalli, shuffledQty: row.kootapalli, isRedirected: false, donatedCount: 0 },
-    gmFashionsWarehouse: { originalQty: row.gmFashionsWarehouse, shuffledQty: row.gmFashionsWarehouse, isRedirected: false, donatedCount: 0 },
+    mallur: { originalQty: row.mallur, shuffledQty: row.mallur, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    thiruvannamalai: { originalQty: row.thiruvannamalai, shuffledQty: row.thiruvannamalai, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    kumbakonam: { originalQty: row.kumbakonam, shuffledQty: row.kumbakonam, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    karur: { originalQty: row.karur, shuffledQty: row.karur, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    salem: { originalQty: row.salem, shuffledQty: row.salem, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    namakkal: { originalQty: row.namakkal, shuffledQty: row.namakkal, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    kootapalli: { originalQty: row.kootapalli, shuffledQty: row.kootapalli, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    gmFashionsWarehouse: { originalQty: row.gmFashionsWarehouse, shuffledQty: row.gmFashionsWarehouse, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
   };
 
   let totalRedirectedInRow = 0;
@@ -155,9 +165,20 @@ export function shuffleMatrixRow(row: ToonMatrixRow): ShuffledMatrixRow {
         cellInfo[recipientKey].sourceStoreKey = donorKey;
         cellInfo[recipientKey].sourceShortcut = STORE_SHORTCUTS[donorKey];
         cellInfo[recipientKey].sourceStoreName = STORE_FULL_NAMES[donorKey];
+        cellInfo[recipientKey].borrowedDetails.push({
+          sourceStoreKey: donorKey,
+          sourceShortcut: STORE_SHORTCUTS[donorKey],
+          sourceStoreName: STORE_FULL_NAMES[donorKey],
+          qty: 1,
+        });
 
         cellInfo[donorKey].shuffledQty = currentStocks[donorKey];
         cellInfo[donorKey].donatedCount += 1;
+        cellInfo[donorKey].donatedToStores.push({
+          storeKey: recipientKey,
+          shortcut: STORE_SHORTCUTS[recipientKey],
+          name: STORE_FULL_NAMES[recipientKey],
+        });
 
         totalRedirectedInRow += 1;
       }
@@ -176,6 +197,7 @@ export function shuffleMatrixRow(row: ToonMatrixRow): ShuffledMatrixRow {
     gmFashionsWarehouse: currentStocks.gmFashionsWarehouse,
     cellInfo,
     totalRedirectedInRow,
+    originalRow: row,
   };
 }
 

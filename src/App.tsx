@@ -29,7 +29,7 @@ import {
   clearSalesStorage,
   SalesSearchState,
 } from './utils/storage';
-import { CheckCircle2, AlertTriangle, ArrowLeft, Heart } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, ArrowLeft } from 'lucide-react';
 
 export default function App() {
   // Navigation state: 'home' | 'instant' | 'report'
@@ -405,11 +405,10 @@ export default function App() {
             <span>Inventory &amp; Reporting Suite</span>
           </div>
           <div
-            id="footer-made-by-manoj"
+            id="footer-made-by"
             className="flex items-center gap-1.5 font-medium text-slate-600"
           >
-            <span>Made by Manoj</span>
-            <Heart className="w-3.5 h-3.5 text-red-500 fill-red-500 inline shrink-0" />
+            <span>Made By Two Fellows😎</span>
           </div>
         </div>
       </footer>
