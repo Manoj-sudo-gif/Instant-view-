@@ -19,9 +19,6 @@ import {
   exportEanExcel,
 } from './utils/excelParser';
 import {
-  loadSessionFromStorage,
-  saveSalesDataToStorage,
-  saveSalesSearchToStorage,
   clearStorageSession,
   clearStockStorage,
   clearSalesStorage,
@@ -55,25 +52,13 @@ export default function App() {
     filename: string;
   } | null>(null);
 
-  // Load persisted session on initial mount:
-  // Purges any old dumped stock cache from browser storage so the app stays fast and starts fresh on reload
+  // On initial mount:
+  // Purges any old dumped storage cache so both Stock and Sales start 100% fresh on reload
   useEffect(() => {
-    clearStockStorage();
-
-    loadSessionFromStorage().then((session) => {
-      if (session) {
-        if (session.salesItems && session.salesItems.length > 0) {
-          setSalesItems(session.salesItems);
-          setSalesFileInfo(session.salesFileInfo);
-          if (session.salesSearchState) {
-            setSalesSearchState(session.salesSearchState);
-          }
-        }
-      }
-    });
+    clearStorageSession();
 
     const handleBeforeUnload = () => {
-      clearStockStorage();
+      clearStorageSession();
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
@@ -109,15 +94,11 @@ export default function App() {
     setLastExportFilename(null);
   };
 
-  // Handle sales data upload completion
+  // Handle sales data upload completion:
+  // Kept in active React state for high-speed in-memory session; not permanently dumped into browser disk
   const handleSalesDataLoaded = (items: MappedSalesItem[], info: UploadedFileInfo) => {
     setSalesItems(items);
     setSalesFileInfo(info);
-    saveSalesDataToStorage(items, info);
-    console.log(
-      `%c[GM Fashions Storage Cache] Stored ${items.length} Sales items to browser cache.`,
-      'color: #6366f1; font-weight: bold;'
-    );
   };
 
   // Reset / Replace data (Clear full session for both)
@@ -202,13 +183,11 @@ export default function App() {
       isAllStores,
     };
     setSalesSearchState(newSalesSearch);
-    saveSalesSearchToStorage(newSalesSearch);
   };
 
   // Clear sales search
   const handleClearSalesSearch = () => {
     setSalesSearchState(null);
-    saveSalesSearchToStorage(null);
   };
 
   // Explicit manual Excel (.xlsx) download triggered ONLY upon user click

@@ -78,64 +78,29 @@ export async function saveStockSearchToStorage(
 /**
  * Save Sales data to browser IndexedDB storage
  */
+/**
+ * Save Sales data to browser IndexedDB storage.
+ * Sales data is kept purely in-memory for active session speed.
+ * We do not persist massive sales datasets to permanent IndexedDB to avoid dumping browser storage.
+ */
 export async function saveSalesDataToStorage(
-  items: MappedSalesItem[],
-  info: UploadedFileInfo | null
+  _items: MappedSalesItem[],
+  _info: UploadedFileInfo | null
 ): Promise<void> {
-  try {
-    const db = await openDB();
-    const tx = db.transaction(STORE_CACHE, 'readwrite');
-    const store = tx.objectStore(STORE_CACHE);
-
-    const getReq = store.get('current_session');
-    getReq.onsuccess = () => {
-      const existing: CachedSessionData = getReq.result || {
-        id: 'current_session',
-        stockItems: [],
-        stockFileInfo: null,
-        salesItems: [],
-        salesFileInfo: null,
-        savedAt: Date.now(),
-      };
-
-      existing.salesItems = items;
-      existing.salesFileInfo = info;
-      existing.savedAt = Date.now();
-
-      store.put(existing);
-    };
-  } catch (err) {
-    console.warn('Failed to persist sales data in browser storage:', err);
-  }
+  // In-memory session: deliberate no-op to ensure snappy performance and fresh start on reload
 }
 
 /**
  * Save Sales search criteria (Toon Label query, store filters) to browser IndexedDB storage
  */
 export async function saveSalesSearchToStorage(
-  searchState: SalesSearchState | null
+  _searchState: SalesSearchState | null
 ): Promise<void> {
-  try {
-    const db = await openDB();
-    const tx = db.transaction(STORE_CACHE, 'readwrite');
-    const store = tx.objectStore(STORE_CACHE);
-
-    const getReq = store.get('current_session');
-    getReq.onsuccess = () => {
-      if (getReq.result) {
-        const existing: CachedSessionData = getReq.result;
-        existing.salesSearchState = searchState;
-        existing.savedAt = Date.now();
-        store.put(existing);
-      }
-    };
-  } catch (err) {
-    console.warn('Failed to persist sales search in browser storage:', err);
-  }
+  // In-memory session: deliberate no-op for fresh start on reload
 }
 
 /**
- * Load both Stock and Sales data + search states from browser storage on app boot
+ * Load session data on app boot - always returns clean fresh state so the app starts fresh
  */
 export async function loadSessionFromStorage(): Promise<{
   stockItems: MappedInventoryItem[];
@@ -145,36 +110,15 @@ export async function loadSessionFromStorage(): Promise<{
   salesFileInfo: UploadedFileInfo | null;
   salesSearchState: SalesSearchState | null;
 } | null> {
-  try {
-    const db = await openDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction(STORE_CACHE, 'readonly');
-      const store = tx.objectStore(STORE_CACHE);
-      const req = store.get('current_session');
-
-      req.onsuccess = () => {
-        const data = req.result as CachedSessionData | undefined;
-        if (data) {
-          // Stock report always starts completely fresh on reload as requested
-          resolve({
-            stockItems: [],
-            stockFileInfo: null,
-            stockSearchState: null,
-            salesItems: data.salesItems || [],
-            salesFileInfo: data.salesFileInfo || null,
-            salesSearchState: data.salesSearchState || null,
-          });
-        } else {
-          resolve(null);
-        }
-      };
-
-      req.onerror = () => resolve(null);
-    });
-  } catch (err) {
-    console.warn('Failed to load session from browser storage:', err);
-    return null;
-  }
+  // Both Stock and Sales reports always start completely fresh on reload as requested
+  return {
+    stockItems: [],
+    stockFileInfo: null,
+    stockSearchState: null,
+    salesItems: [],
+    salesFileInfo: null,
+    salesSearchState: null,
+  };
 }
 
 /**
@@ -185,7 +129,7 @@ export async function clearStorageSession(): Promise<void> {
     const db = await openDB();
     const tx = db.transaction(STORE_CACHE, 'readwrite');
     const store = tx.objectStore(STORE_CACHE);
-    store.delete('current_session');
+    store.clear();
   } catch (err) {
     console.warn('Failed to clear browser storage:', err);
   }
