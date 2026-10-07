@@ -13,12 +13,18 @@ import {
   RotateCcw,
   Copy,
   Check,
+  SlidersHorizontal,
+  Plus,
+  Trash2,
+  ArrowRight,
+  Sparkles,
 } from 'lucide-react';
 import {
   MappedInventoryItem,
   SearchState,
   StoreName,
   ALL_STORES,
+  ToonMatrixRow,
 } from '../types/inventory';
 import {
   exportToonLabelExcel,
@@ -33,8 +39,24 @@ import {
   shuffleMatrixData,
   ShuffledMatrixRow,
   MatrixStoreKey,
+  ManualTransfer,
+  applyManualMatrixData,
+  extractAllAutoTransfers,
+  STORE_SHORTCUTS,
+  STORE_FULL_NAMES,
 } from '../utils/stockShuffle';
 import { StoreStockCards } from './StoreStockCards';
+
+const ALL_STORE_KEYS: MatrixStoreKey[] = [
+  'kootapalli',
+  'karur',
+  'salem',
+  'namakkal',
+  'kumbakonam',
+  'thiruvannamalai',
+  'mallur',
+  'gmFashionsWarehouse',
+];
 
 interface RoughViewTableProps {
   items: MappedInventoryItem[];
@@ -167,14 +189,22 @@ export function RoughViewTable({
   const [sortAsc, setSortAsc] = useState(searchState.type === 'TOON' ? true : false);
   const [viewMode, setViewMode] = useState<'table' | 'matrix'>('table');
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
-  const [isShuffled, setIsShuffled] = useState(false);
+  const [shuffleMode, setShuffleMode] = useState<'off' | 'auto' | 'manual'>('off');
+  const isShuffled = shuffleMode !== 'off';
+  const [manualTransfersMap, setManualTransfersMap] = useState<Record<string, ManualTransfer[]>>({});
+  const [editingRowKey, setEditingRowKey] = useState<string | null>(null);
+  const [newTransferFrom, setNewTransferFrom] = useState<MatrixStoreKey | ''>('');
+  const [newTransferTo, setNewTransferTo] = useState<MatrixStoreKey | ''>('');
+  const [newTransferQty, setNewTransferQty] = useState<number>(1);
   const [copiedAllEans, setCopiedAllEans] = useState(false);
   const [copiedEan, setCopiedEan] = useState<string | null>(null);
 
   // Sync sort when search type or query changes:
   // TOON searches automatically prioritize 1st: Toon Label (asc), 2nd: Colour (asc), 3rd: Size (32, 34, 36... or S, M, L...)
   useEffect(() => {
-    setIsShuffled(false);
+    setShuffleMode('off');
+    setManualTransfersMap({});
+    setEditingRowKey(null);
     if (searchState.type === 'TOON') {
       setSortField('toonLabel');
       setSortAsc(true);
@@ -320,10 +350,89 @@ export function RoughViewTable({
     return generateToonLabelMatrix(filteredItems);
   }, [filteredItems, searchState.type, viewMode]);
 
-  // Pre-calculate shuffled matrix data with stock redistribution
-  const shuffledResult = useMemo(() => {
+  // Pre-calculate auto shuffled matrix data with stock redistribution
+  const autoShuffledResult = useMemo(() => {
     return shuffleMatrixData(matrixData);
   }, [matrixData]);
+
+  // Active shuffled matrix data: auto redistribution OR user's custom manual transfers
+  const shuffledResult = useMemo(() => {
+    if (shuffleMode === 'manual') {
+      return applyManualMatrixData(matrixData, manualTransfersMap);
+    }
+    return autoShuffledResult;
+  }, [shuffleMode, matrixData, manualTransfersMap, autoShuffledResult]);
+
+  // Total count of manual movements across all rows
+  const totalManualTransfersCount = useMemo(() => {
+    return Object.values(manualTransfersMap).reduce(
+      (acc: number, arr: ManualTransfer[]) => acc + (arr ? arr.length : 0),
+      0
+    );
+  }, [manualTransfersMap]);
+
+  // Available stock helper for donor store in a row (accounting for already assigned transfers in that row)
+  const getAvailableStock = (row: ToonMatrixRow, storeKey: MatrixStoreKey): number => {
+    const rowKey = `${row.colour}__${row.toonLabel}__${row.size}`;
+    const rowTransfers = manualTransfersMap[rowKey] || [];
+    const donated = rowTransfers
+      .filter((t) => t.fromStore === storeKey)
+      .reduce((acc, t) => acc + t.qty, 0);
+    return Math.max(0, row[storeKey] - donated);
+  };
+
+  // Remove a manual transfer
+  const handleRemoveTransfer = (rowKey: string, transferId: string) => {
+    setManualTransfersMap((prev) => {
+      const existing = prev[rowKey] || [];
+      const updated = existing.filter((t) => t.id !== transferId);
+      if (updated.length === 0) {
+        const next = { ...prev };
+        delete next[rowKey];
+        return next;
+      }
+      return { ...prev, [rowKey]: updated };
+    });
+  };
+
+  // Add a manual transfer
+  const handleAddTransfer = (
+    rowKey: string,
+    fromStore: MatrixStoreKey,
+    toStore: MatrixStoreKey,
+    qty: number
+  ) => {
+    if (!fromStore || !toStore || fromStore === toStore || qty < 1) return;
+    setManualTransfersMap((prev) => {
+      const existing = prev[rowKey] || [];
+      const newTransfer: ManualTransfer = {
+        id: `mt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        fromStore,
+        toStore,
+        qty,
+      };
+      return {
+        ...prev,
+        [rowKey]: [...existing, newTransfer],
+      };
+    });
+    setEditingRowKey(null);
+    setNewTransferFrom('');
+    setNewTransferTo('');
+    setNewTransferQty(1);
+  };
+
+  // Copy all recommended transfers from auto shuffle into manual editor
+  const handleCopyFromAutoShuffle = () => {
+    const autoTransfers = extractAllAutoTransfers(autoShuffledResult.shuffledRows);
+    setManualTransfersMap(autoTransfers);
+  };
+
+  // Clear all custom transfers
+  const handleClearAllManualTransfers = () => {
+    setManualTransfersMap({});
+    setEditingRowKey(null);
+  };
 
   // Group matrixData by (toonLabel, colour) so repeated colors (e.g. 10 sizes of Blue) are visually merged
   const matrixGroups = useMemo(() => {
@@ -1307,40 +1416,119 @@ export function RoughViewTable({
             </div>
           </div>
 
-          {/* 2. SHUFFLE BUTTON ONLY (Directly below Store Matrix) */}
+          {/* 2. SHUFFLE BUTTONS: AUTO SHUFFLE & MANUAL SHUFFLE */}
           {matrixData.length > 0 && (
             <div
               id="matrix-shuffle-panel"
-              className="flex flex-wrap items-center justify-between gap-3 py-2 px-1"
+              className="flex flex-wrap items-center justify-between gap-3 py-3 px-1 border-t border-slate-200 mt-2"
             >
-              <div>
-                {!isShuffled ? (
-                  <button
-                    type="button"
-                    id="btn-shuffle-stocks"
-                    onClick={() => setIsShuffled(true)}
-                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white font-bold text-sm shadow-md transition-all cursor-pointer"
-                  >
-                    <Shuffle className="w-4 h-4" />
-                    <span>Shuffle</span>
-                  </button>
-                ) : (
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* 1. AUTO SHUFFLE BUTTON */}
+                <button
+                  type="button"
+                  id="btn-auto-shuffle-stocks"
+                  onClick={() => {
+                    setShuffleMode((prev) => (prev === 'auto' ? 'off' : 'auto'));
+                    setEditingRowKey(null);
+                  }}
+                  className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-lg font-bold text-xs sm:text-sm shadow-xs transition-all cursor-pointer ${
+                    shuffleMode === 'auto'
+                      ? 'bg-indigo-600 hover:bg-indigo-700 text-white ring-2 ring-indigo-400 ring-offset-1 shadow-md'
+                      : 'bg-white hover:bg-indigo-50/60 text-slate-700 hover:text-indigo-700 border border-slate-300'
+                  }`}
+                  title="Automatically redistribute stock to zero-stock stores based on store priorities"
+                >
+                  <Shuffle className="w-4 h-4 text-indigo-500" />
+                  <span>Auto Shuffle</span>
+                  {shuffleMode === 'auto' && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-indigo-800 text-indigo-100 uppercase tracking-wider font-extrabold">
+                      Active
+                    </span>
+                  )}
+                </button>
+
+                {/* 2. MANUAL SHUFFLE BUTTON */}
+                <button
+                  type="button"
+                  id="btn-manual-shuffle-stocks"
+                  onClick={() => {
+                    setShuffleMode((prev) => (prev === 'manual' ? 'off' : 'manual'));
+                    setEditingRowKey(null);
+                  }}
+                  className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-lg font-bold text-xs sm:text-sm shadow-xs transition-all cursor-pointer ${
+                    shuffleMode === 'manual'
+                      ? 'bg-purple-700 hover:bg-purple-800 text-white ring-2 ring-purple-400 ring-offset-1 shadow-md'
+                      : 'bg-white hover:bg-purple-50/60 text-slate-700 hover:text-purple-700 border border-slate-300'
+                  }`}
+                  title="Manually edit and customize which shop stock should be transferred to"
+                >
+                  <SlidersHorizontal className="w-4 h-4 text-purple-600" />
+                  <span>Manual Shuffle (Edit)</span>
+                  {shuffleMode === 'manual' && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-purple-900 text-purple-100 uppercase tracking-wider font-extrabold">
+                      Active
+                    </span>
+                  )}
+                </button>
+
+                {/* HIDE / CLOSE SHUFFLE BUTTON */}
+                {shuffleMode !== 'off' && (
                   <button
                     type="button"
                     id="btn-reset-shuffle"
-                    onClick={() => setIsShuffled(false)}
-                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-white hover:bg-slate-100 active:scale-95 text-slate-700 font-bold text-sm border border-slate-300 shadow-xs transition-all cursor-pointer"
+                    onClick={() => {
+                      setShuffleMode('off');
+                      setEditingRowKey(null);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white hover:bg-slate-100 active:scale-95 text-slate-600 font-semibold text-xs border border-slate-300 shadow-xs transition-all cursor-pointer"
+                    title="Hide Shuffled Matrix views"
                   >
-                    <RotateCcw className="w-4 h-4 text-slate-500" />
+                    <RotateCcw className="w-3.5 h-3.5 text-slate-400" />
                     <span>Hide Shuffled Matrix</span>
                   </button>
                 )}
               </div>
 
-              {isShuffled && (
-                <div className="flex items-center gap-2 text-xs font-semibold text-purple-900 bg-purple-50 border border-purple-200 px-3 py-1.5 rounded-lg">
-                  <span className="inline-block w-2 h-2 rounded-full bg-purple-600"></span>
-                  <span>Shuffled Matrix Active ({shuffledResult.totalRedirectedUnits} units borrowed)</span>
+              {/* STATUS INDICATORS & QUICK MANUAL ACTIONS */}
+              {shuffleMode === 'auto' && (
+                <div className="flex items-center gap-2 text-xs font-semibold text-indigo-900 bg-indigo-50 border border-indigo-200 px-3 py-1.5 rounded-lg">
+                  <span className="inline-block w-2 h-2 rounded-full bg-indigo-600 animate-pulse"></span>
+                  <span>Auto Shuffle Active ({shuffledResult.totalRedirectedUnits} units redistributed)</span>
+                </div>
+              )}
+
+              {shuffleMode === 'manual' && (
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <div className="flex items-center gap-2 font-semibold text-purple-900 bg-purple-50 border border-purple-200 px-3 py-1.5 rounded-lg">
+                    <span className="inline-block w-2 h-2 rounded-full bg-purple-600 animate-pulse"></span>
+                    <span>
+                      Manual Shuffle Active ({totalManualTransfersCount} movements, {shuffledResult.totalRedirectedUnits} units)
+                    </span>
+                  </div>
+
+                  {/* Copy from Auto Shuffle Recommendations */}
+                  <button
+                    type="button"
+                    onClick={handleCopyFromAutoShuffle}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-purple-50 text-purple-700 font-semibold text-xs border border-purple-300 shadow-2xs transition-colors cursor-pointer"
+                    title="Pre-fill manual matrix with automated recommendations so you can adjust them"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-purple-600" />
+                    <span>Copy Auto Recommendations</span>
+                  </button>
+
+                  {/* Clear all custom transfers */}
+                  {totalManualTransfersCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleClearAllManualTransfers}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-rose-50 text-rose-600 font-semibold text-xs border border-rose-300 shadow-2xs transition-colors cursor-pointer"
+                      title="Clear all manual movements"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                      <span>Clear All Transfers</span>
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -1353,9 +1541,17 @@ export function RoughViewTable({
                 <div className="flex items-center gap-2">
                   <span className="inline-block w-3 h-3 rounded-full bg-purple-600 animate-pulse"></span>
                   <h3 className="text-sm font-extrabold text-purple-900 tracking-tight flex items-center gap-2">
-                    <span>Shuffled Transfer Action Matrix</span>
-                    <span className="text-xs px-2.5 py-0.5 rounded-full bg-purple-100 text-purple-800 border border-purple-300 font-bold">
-                      Worker Action Guide
+                    <span>
+                      {shuffleMode === 'manual' ? 'Manual Transfer Action Matrix' : 'Shuffled Transfer Action Matrix'}
+                    </span>
+                    <span
+                      className={`text-xs px-2.5 py-0.5 rounded-full font-bold ${
+                        shuffleMode === 'manual'
+                          ? 'bg-purple-200 text-purple-900 border border-purple-400'
+                          : 'bg-purple-100 text-purple-800 border border-purple-300'
+                      }`}
+                    >
+                      {shuffleMode === 'manual' ? 'Manual Edit Mode' : 'Worker Action Guide'}
                     </span>
                   </h3>
                 </div>
@@ -1397,6 +1593,11 @@ export function RoughViewTable({
                       <th className="px-3.5 py-3 text-right font-bold text-purple-900 bg-purple-100/80">
                         Size Total
                       </th>
+                      {shuffleMode === 'manual' && (
+                        <th className="px-3.5 py-3 text-center font-bold text-purple-950 bg-purple-200/90 min-w-[170px]">
+                          Manual Movements
+                        </th>
+                      )}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-purple-100 text-xs text-slate-700">
@@ -1404,69 +1605,231 @@ export function RoughViewTable({
                       const gInfo = groupInfoMap.get(idx);
                       const isFirst = gInfo ? gInfo.isFirst : true;
                       const count = gInfo ? gInfo.count : 1;
+                      const rowKey = `${row.colour}__${row.toonLabel}__${row.size}`;
+                      const rowTransfers = manualTransfersMap[rowKey] || [];
+                      const isRowEditing = editingRowKey === rowKey;
 
                       return (
-                        <tr
-                          key={`shuffled-matrix-${idx}`}
-                          className={`hover:bg-purple-50/30 transition-colors ${
-                            isFirst && idx > 0 ? 'border-t-2 border-purple-200' : ''
-                          }`}
-                        >
-                          {isFirst && (
-                            <td
-                              rowSpan={count}
-                              className="px-3.5 py-3 text-center align-middle border-r border-purple-100 bg-white font-medium"
-                            >
-                              <span
-                                className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-bold border shadow-2xs ${getColourBadgeClass(
-                                  row.colour
-                                )}`}
+                        <Fragment key={`shuffled-matrix-frag-${idx}`}>
+                          <tr
+                            key={`shuffled-matrix-${idx}`}
+                            className={`hover:bg-purple-50/30 transition-colors ${
+                              isFirst && idx > 0 ? 'border-t-2 border-purple-200' : ''
+                            } ${isRowEditing ? 'bg-purple-50/40' : ''}`}
+                          >
+                            {isFirst && (
+                              <td
+                                rowSpan={count}
+                                className="px-3.5 py-3 text-center align-middle border-r border-purple-100 bg-white font-medium"
                               >
-                                {row.colour}
+                                <span
+                                  className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-bold border shadow-2xs ${getColourBadgeClass(
+                                    row.colour
+                                  )}`}
+                                >
+                                  {row.colour}
+                                </span>
+                              </td>
+                            )}
+                            {isFirst && (
+                              <td
+                                rowSpan={count}
+                                className="px-3.5 py-3 text-center align-middle font-mono font-bold text-purple-900 bg-purple-50/40 border-r border-purple-100"
+                              >
+                                {row.toonLabel}
+                              </td>
+                            )}
+                            <td className="px-3.5 py-2.5 text-center font-mono font-bold text-slate-800 border-r border-purple-100">
+                              <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200">
+                                {row.size}
                               </span>
                             </td>
-                          )}
-                          {isFirst && (
-                            <td
-                              rowSpan={count}
-                              className="px-3.5 py-3 text-center align-middle font-mono font-bold text-purple-900 bg-purple-50/40 border-r border-purple-100"
-                            >
-                              {row.toonLabel}
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('kootapalli', row)}
                             </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('karur', row)}
+                            </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('salem', row)}
+                            </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('namakkal', row)}
+                            </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('kumbakonam', row)}
+                            </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('thiruvannamalai', row)}
+                            </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('mallur', row)}
+                            </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono">
+                              {renderShuffledMatrixCell('gmFashionsWarehouse', row)}
+                            </td>
+                            <td className="px-3.5 py-2.5 text-right font-mono font-bold text-purple-900 bg-purple-50/70">
+                              {row.sizeTotal}
+                            </td>
+
+                            {/* MANUAL EDIT ACTIONS COLUMN */}
+                            {shuffleMode === 'manual' && (
+                              <td className="px-3 py-2 text-center align-middle border-l border-purple-200 bg-purple-50/30">
+                                <div className="flex flex-col items-center gap-1.5 min-w-[140px]">
+                                  {rowTransfers.length > 0 && (
+                                    <div className="flex flex-wrap items-center justify-center gap-1">
+                                      {rowTransfers.map((t) => (
+                                        <span
+                                          key={t.id}
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-100 border border-purple-300 text-[10px] font-bold text-purple-900 shadow-2xs"
+                                          title={`From ${STORE_FULL_NAMES[t.fromStore]} to ${STORE_FULL_NAMES[t.toStore]} (${t.qty} piece(s))`}
+                                        >
+                                          <span>
+                                            {STORE_SHORTCUTS[t.fromStore]} &rarr; {STORE_SHORTCUTS[t.toStore]} (+{t.qty})
+                                          </span>
+                                          <button
+                                            type="button"
+                                            onClick={() => handleRemoveTransfer(rowKey, t.id)}
+                                            className="hover:text-red-600 cursor-pointer ml-0.5 font-bold"
+                                            title="Remove transfer"
+                                          >
+                                            ✕
+                                          </button>
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (editingRowKey === rowKey) {
+                                        setEditingRowKey(null);
+                                      } else {
+                                        setEditingRowKey(rowKey);
+                                        const donor = ALL_STORE_KEYS.find((k) => getAvailableStock(row, k) > 0);
+                                        setNewTransferFrom(donor || '');
+                                        const recipient = ALL_STORE_KEYS.find((k) => k !== donor && row[k] === 0);
+                                        setNewTransferTo(recipient || (ALL_STORE_KEYS.find((k) => k !== donor) || ''));
+                                        setNewTransferQty(1);
+                                      }
+                                    }}
+                                    className={`inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded-md font-bold cursor-pointer transition-all ${
+                                      isRowEditing
+                                        ? 'bg-purple-800 text-white'
+                                        : 'bg-purple-600 hover:bg-purple-700 text-white shadow-2xs active:scale-95'
+                                    }`}
+                                  >
+                                    <Plus className="w-3 h-3" />
+                                    <span>{isRowEditing ? 'Close Editor' : '+ Move Stock'}</span>
+                                  </button>
+                                </div>
+                              </td>
+                            )}
+                          </tr>
+
+                          {/* INLINE ROW TRANSFER BUILDER */}
+                          {isRowEditing && shuffleMode === 'manual' && (
+                            <tr className="bg-purple-50 border-y-2 border-purple-300">
+                              <td colSpan={13} className="px-4 py-2.5">
+                                <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-2.5 rounded-lg border border-purple-200 shadow-xs">
+                                  <div className="flex items-center gap-2">
+                                    <span className="w-2.5 h-2.5 rounded-full bg-purple-600"></span>
+                                    <span className="text-xs font-bold text-purple-950">
+                                      Custom Movement for <span className="underline decoration-purple-400 font-mono">{row.size}</span> ({row.colour}):
+                                    </span>
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                                    {/* FROM STORE */}
+                                    <div className="flex items-center gap-1">
+                                      <span className="text-[11px] text-slate-500 font-semibold">From Store:</span>
+                                      <select
+                                        value={newTransferFrom}
+                                        onChange={(e) => {
+                                          const val = e.target.value as MatrixStoreKey;
+                                          setNewTransferFrom(val);
+                                          if (newTransferTo === val) {
+                                            const alt = ALL_STORE_KEYS.find((k) => k !== val) || '';
+                                            setNewTransferTo(alt);
+                                          }
+                                        }}
+                                        className="text-xs px-2 py-1 rounded border border-purple-300 bg-purple-50/50 font-bold text-purple-900 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                                      >
+                                        <option value="" disabled>Select Donor Store</option>
+                                        {ALL_STORE_KEYS.map((k) => {
+                                          const avail = getAvailableStock(row, k);
+                                          return (
+                                            <option key={`from-${k}`} value={k} disabled={avail <= 0}>
+                                              {STORE_FULL_NAMES[k]} ({STORE_SHORTCUTS[k]}) - Stock: {avail}
+                                            </option>
+                                          );
+                                        })}
+                                      </select>
+                                    </div>
+
+                                    <ArrowRight className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+
+                                    {/* TO STORE */}
+                                    <div className="flex items-center gap-1">
+                                      <span className="text-[11px] text-slate-500 font-semibold">To Shop:</span>
+                                      <select
+                                        value={newTransferTo}
+                                        onChange={(e) => setNewTransferTo(e.target.value as MatrixStoreKey)}
+                                        className="text-xs px-2 py-1 rounded border border-purple-300 bg-purple-50/50 font-bold text-purple-900 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                                      >
+                                        <option value="" disabled>Select Target Shop</option>
+                                        {ALL_STORE_KEYS.filter((k) => k !== newTransferFrom).map((k) => {
+                                          const currentStock = row[k];
+                                          return (
+                                            <option key={`to-${k}`} value={k}>
+                                              {STORE_FULL_NAMES[k]} ({STORE_SHORTCUTS[k]}) {currentStock === 0 ? '★ [0 Stock]' : `(Stock: ${currentStock})`}
+                                            </option>
+                                          );
+                                        })}
+                                      </select>
+                                    </div>
+
+                                    {/* QUANTITY */}
+                                    <div className="flex items-center gap-1">
+                                      <span className="text-[11px] text-slate-500 font-semibold">Qty:</span>
+                                      <input
+                                        type="number"
+                                        min={1}
+                                        max={newTransferFrom ? getAvailableStock(row, newTransferFrom) : 1}
+                                        value={newTransferQty}
+                                        onChange={(e) => setNewTransferQty(Math.max(1, parseInt(e.target.value) || 1))}
+                                        className="w-12 text-xs px-1.5 py-1 rounded border border-purple-300 bg-white font-mono font-bold text-center text-purple-900"
+                                      />
+                                    </div>
+
+                                    {/* APPLY / CANCEL */}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        if (newTransferFrom && newTransferTo) {
+                                          handleAddTransfer(rowKey, newTransferFrom, newTransferTo, newTransferQty);
+                                        }
+                                      }}
+                                      disabled={!newTransferFrom || !newTransferTo || getAvailableStock(row, newTransferFrom) < newTransferQty}
+                                      className="px-3 py-1 rounded bg-purple-700 hover:bg-purple-800 disabled:bg-slate-300 text-white font-bold text-xs shadow-xs transition-all cursor-pointer"
+                                    >
+                                      Apply Movement
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingRowKey(null)}
+                                      className="px-2.5 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-600 font-semibold text-xs transition-all cursor-pointer"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
                           )}
-                          <td className="px-3.5 py-2.5 text-center font-mono font-bold text-slate-800 border-r border-purple-100">
-                            <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200">
-                              {row.size}
-                            </span>
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('kootapalli', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('karur', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('salem', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('namakkal', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('kumbakonam', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('thiruvannamalai', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('mallur', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono">
-                            {renderShuffledMatrixCell('gmFashionsWarehouse', row)}
-                          </td>
-                          <td className="px-3.5 py-2.5 text-right font-mono font-bold text-purple-900 bg-purple-50/70">
-                            {row.sizeTotal}
-                          </td>
-                        </tr>
+                        </Fragment>
                       );
                     })}
                   </tbody>
@@ -1489,6 +1852,11 @@ export function RoughViewTable({
                         <td className="px-3.5 py-3 text-right font-mono font-black text-purple-950 bg-purple-200/90">
                           {shuffledTotals.sizeTotal}
                         </td>
+                        {shuffleMode === 'manual' && (
+                          <td className="px-3.5 py-3 text-center font-bold text-purple-950 bg-purple-200/90">
+                            {totalManualTransfersCount} movements
+                          </td>
+                        )}
                       </tr>
                     </tfoot>
                   )}
@@ -1506,12 +1874,16 @@ export function RoughViewTable({
                   <h3 className="text-sm font-extrabold text-slate-900 tracking-tight flex items-center gap-2">
                     <span>Final Prediction Matrix</span>
                     <span className="text-xs px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 font-bold">
-                      Post-Shuffle Final Target Inventory
+                      {shuffleMode === 'manual'
+                        ? 'Post-Manual Final Target Inventory'
+                        : 'Post-Shuffle Final Target Inventory'}
                     </span>
                   </h3>
                 </div>
                 <div className="text-xs text-slate-500 font-medium">
-                  Clean resultant stock count for all stores after redistribution
+                  {shuffleMode === 'manual'
+                    ? 'Clean resultant stock count for all stores after your custom manual transfers'
+                    : 'Clean resultant stock count for all stores after redistribution'}
                 </div>
               </div>
 

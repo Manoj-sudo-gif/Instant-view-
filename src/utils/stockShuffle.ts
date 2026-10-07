@@ -216,3 +216,161 @@ export function shuffleMatrixData(rows: ToonMatrixRow[]): {
   });
   return { shuffledRows, totalRedirectedUnits };
 }
+
+export interface ManualTransfer {
+  id: string;
+  fromStore: MatrixStoreKey;
+  toStore: MatrixStoreKey;
+  qty: number;
+}
+
+/**
+ * Applies custom manual store-to-store transfers to a matrix row.
+ */
+export function applyManualTransfersToMatrixRow(
+  row: ToonMatrixRow,
+  transfers: ManualTransfer[]
+): ShuffledMatrixRow {
+  const currentStocks: Record<MatrixStoreKey, number> = {
+    mallur: row.mallur,
+    thiruvannamalai: row.thiruvannamalai,
+    kumbakonam: row.kumbakonam,
+    karur: row.karur,
+    salem: row.salem,
+    namakkal: row.namakkal,
+    kootapalli: row.kootapalli,
+    gmFashionsWarehouse: row.gmFashionsWarehouse,
+  };
+
+  const cellInfo: Record<MatrixStoreKey, StoreCellShuffleInfo> = {
+    mallur: { originalQty: row.mallur, shuffledQty: row.mallur, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    thiruvannamalai: { originalQty: row.thiruvannamalai, shuffledQty: row.thiruvannamalai, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    kumbakonam: { originalQty: row.kumbakonam, shuffledQty: row.kumbakonam, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    karur: { originalQty: row.karur, shuffledQty: row.karur, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    salem: { originalQty: row.salem, shuffledQty: row.salem, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    namakkal: { originalQty: row.namakkal, shuffledQty: row.namakkal, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    kootapalli: { originalQty: row.kootapalli, shuffledQty: row.kootapalli, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+    gmFashionsWarehouse: { originalQty: row.gmFashionsWarehouse, shuffledQty: row.gmFashionsWarehouse, isRedirected: false, donatedCount: 0, borrowedDetails: [], donatedToStores: [] },
+  };
+
+  let totalRedirectedInRow = 0;
+
+  for (const t of transfers) {
+    if (!t.fromStore || !t.toStore || t.fromStore === t.toStore) continue;
+    const qty = Math.max(1, Number(t.qty) || 1);
+
+    currentStocks[t.fromStore] -= qty;
+    currentStocks[t.toStore] += qty;
+
+    cellInfo[t.toStore].shuffledQty = currentStocks[t.toStore];
+    cellInfo[t.toStore].isRedirected = true;
+    cellInfo[t.toStore].sourceStoreKey = t.fromStore;
+    cellInfo[t.toStore].sourceShortcut = STORE_SHORTCUTS[t.fromStore];
+    cellInfo[t.toStore].sourceStoreName = STORE_FULL_NAMES[t.fromStore];
+    cellInfo[t.toStore].borrowedDetails.push({
+      sourceStoreKey: t.fromStore,
+      sourceShortcut: STORE_SHORTCUTS[t.fromStore],
+      sourceStoreName: STORE_FULL_NAMES[t.fromStore],
+      qty: qty,
+    });
+
+    cellInfo[t.fromStore].shuffledQty = currentStocks[t.fromStore];
+    cellInfo[t.fromStore].donatedCount += qty;
+    cellInfo[t.fromStore].donatedToStores.push({
+      storeKey: t.toStore,
+      shortcut: STORE_SHORTCUTS[t.toStore],
+      name: STORE_FULL_NAMES[t.toStore],
+    });
+
+    totalRedirectedInRow += qty;
+  }
+
+  return {
+    ...row,
+    mallur: currentStocks.mallur,
+    thiruvannamalai: currentStocks.thiruvannamalai,
+    kumbakonam: currentStocks.kumbakonam,
+    karur: currentStocks.karur,
+    salem: currentStocks.salem,
+    namakkal: currentStocks.namakkal,
+    kootapalli: currentStocks.kootapalli,
+    gmFashionsWarehouse: currentStocks.gmFashionsWarehouse,
+    cellInfo,
+    totalRedirectedInRow,
+    originalRow: row,
+  };
+}
+
+/**
+ * Extracts all transfer movements from an automated ShuffledMatrixRow.
+ */
+export function extractTransfersFromShuffledRow(
+  shuffledRow: ShuffledMatrixRow
+): ManualTransfer[] {
+  const transfers: ManualTransfer[] = [];
+  const storeKeys: MatrixStoreKey[] = [
+    'kootapalli',
+    'karur',
+    'salem',
+    'namakkal',
+    'kumbakonam',
+    'thiruvannamalai',
+    'mallur',
+    'gmFashionsWarehouse',
+  ];
+
+  for (const recipientKey of storeKeys) {
+    const info = shuffledRow.cellInfo[recipientKey];
+    if (info && info.borrowedDetails) {
+      for (const b of info.borrowedDetails) {
+        transfers.push({
+          id: `tr_${recipientKey}_${b.sourceStoreKey}_${Math.random().toString(36).substring(2, 8)}`,
+          fromStore: b.sourceStoreKey,
+          toStore: recipientKey,
+          qty: b.qty,
+        });
+      }
+    }
+  }
+
+  return transfers;
+}
+
+/**
+ * Extracts automated transfers for the entire matrix as a map keyed by rowKey.
+ */
+export function extractAllAutoTransfers(
+  shuffledRows: ShuffledMatrixRow[]
+): Record<string, ManualTransfer[]> {
+  const map: Record<string, ManualTransfer[]> = {};
+  shuffledRows.forEach((row) => {
+    const key = `${row.colour}__${row.toonLabel}__${row.size}`;
+    const transfers = extractTransfersFromShuffledRow(row);
+    if (transfers.length > 0) {
+      map[key] = transfers;
+    }
+  });
+  return map;
+}
+
+/**
+ * Applies manual transfers across all rows of the matrix.
+ */
+export function applyManualMatrixData(
+  rows: ToonMatrixRow[],
+  manualTransfersMap: Record<string, ManualTransfer[]>
+): {
+  shuffledRows: ShuffledMatrixRow[];
+  totalRedirectedUnits: number;
+} {
+  let totalRedirectedUnits = 0;
+  const shuffledRows = rows.map((r) => {
+    const key = `${r.colour}__${r.toonLabel}__${r.size}`;
+    const rowTransfers = manualTransfersMap[key] || [];
+    const res = applyManualTransfersToMatrixRow(r, rowTransfers);
+    totalRedirectedUnits += res.totalRedirectedInRow;
+    return res;
+  });
+  return { shuffledRows, totalRedirectedUnits };
+}
+

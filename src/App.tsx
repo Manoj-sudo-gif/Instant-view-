@@ -20,8 +20,6 @@ import {
 } from './utils/excelParser';
 import {
   loadSessionFromStorage,
-  saveStockDataToStorage,
-  saveStockSearchToStorage,
   saveSalesDataToStorage,
   saveSalesSearchToStorage,
   clearStorageSession,
@@ -57,42 +55,30 @@ export default function App() {
     filename: string;
   } | null>(null);
 
-  // Load persisted session on initial mount
+  // Load persisted session on initial mount:
+  // Purges any old dumped stock cache from browser storage so the app stays fast and starts fresh on reload
   useEffect(() => {
+    clearStockStorage();
+
     loadSessionFromStorage().then((session) => {
       if (session) {
-        if (session.stockItems && session.stockItems.length > 0) {
-          setInventoryItems(session.stockItems);
-          setFileInfo(session.stockFileInfo);
-          if (session.stockSearchState) {
-            setSearchState(session.stockSearchState);
-            const results = filterInventory(
-              session.stockItems,
-              session.stockSearchState.type,
-              session.stockSearchState.query,
-              session.stockSearchState.selectedStores,
-              session.stockSearchState.isAllStores
-            );
-            setSearchResults(results);
-          }
-          console.log(
-            `%c[GM Fashions Storage Cache] Restored ${session.stockItems.length} Stock items from browser cache.`,
-            'color: #10b981; font-weight: bold;'
-          );
-        }
         if (session.salesItems && session.salesItems.length > 0) {
           setSalesItems(session.salesItems);
           setSalesFileInfo(session.salesFileInfo);
           if (session.salesSearchState) {
             setSalesSearchState(session.salesSearchState);
           }
-          console.log(
-            `%c[GM Fashions Storage Cache] Restored ${session.salesItems.length} Sales items from browser cache.`,
-            'color: #10b981; font-weight: bold;'
-          );
         }
       }
     });
+
+    const handleBeforeUnload = () => {
+      clearStockStorage();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
   }, []);
 
   // Unique Toon Labels and EANs for autocomplete & quick sample testing
@@ -112,20 +98,15 @@ export default function App() {
     return Array.from(set);
   }, [inventoryItems]);
 
-  // Handle stock data upload completion
+  // Handle stock data upload completion:
+  // Kept in active React state for high-speed in-memory session; not permanently dumped into browser disk
   const handleDataLoaded = (items: MappedInventoryItem[], info: UploadedFileInfo) => {
     setInventoryItems(items);
     setFileInfo(info);
-    saveStockDataToStorage(items, info);
-    console.log(
-      `%c[GM Fashions Storage Cache] Stored ${items.length} Stock items to browser cache.`,
-      'color: #6366f1; font-weight: bold;'
-    );
     // Clear any previous search results
     setSearchState(null);
     setSearchResults([]);
     setLastExportFilename(null);
-    saveStockSearchToStorage(null);
   };
 
   // Handle sales data upload completion
@@ -179,7 +160,6 @@ export default function App() {
     setSearchState(null);
     setSearchResults([]);
     setLastExportFilename(null);
-    saveStockSearchToStorage(null);
   };
 
   // Execute Search: Filter inventory and display Rough View (NO auto-download)
@@ -207,7 +187,6 @@ export default function App() {
 
     setSearchState(newState);
     setSearchResults(results);
-    saveStockSearchToStorage(newState);
     // Note: Excel download will only trigger when user explicitly clicks the Download Excel button
   };
 

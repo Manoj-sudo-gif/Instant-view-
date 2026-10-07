@@ -55,63 +55,24 @@ function openDB(): Promise<IDBDatabase> {
 }
 
 /**
- * Save Stock data to browser IndexedDB storage
+ * Save Stock data to browser IndexedDB storage.
+ * Stock data is kept purely in-memory for active session speed.
+ * We do not persist massive stock datasets (lakhs of records) to permanent IndexedDB to avoid dumping browser storage.
  */
 export async function saveStockDataToStorage(
-  items: MappedInventoryItem[],
-  info: UploadedFileInfo | null
+  _items: MappedInventoryItem[],
+  _info: UploadedFileInfo | null
 ): Promise<void> {
-  try {
-    const db = await openDB();
-    const tx = db.transaction(STORE_CACHE, 'readwrite');
-    const store = tx.objectStore(STORE_CACHE);
-
-    // Get existing to merge
-    const getReq = store.get('current_session');
-    getReq.onsuccess = () => {
-      const existing: CachedSessionData = getReq.result || {
-        id: 'current_session',
-        stockItems: [],
-        stockFileInfo: null,
-        salesItems: [],
-        salesFileInfo: null,
-        savedAt: Date.now(),
-      };
-
-      existing.stockItems = items;
-      existing.stockFileInfo = info;
-      existing.savedAt = Date.now();
-
-      store.put(existing);
-    };
-  } catch (err) {
-    console.warn('Failed to persist stock data in browser storage:', err);
-  }
+  // In-memory session: deliberate no-op to ensure snappy performance and fresh start on reload
 }
 
 /**
  * Save Stock search criteria to browser IndexedDB storage
  */
 export async function saveStockSearchToStorage(
-  searchState: SearchState | null
+  _searchState: SearchState | null
 ): Promise<void> {
-  try {
-    const db = await openDB();
-    const tx = db.transaction(STORE_CACHE, 'readwrite');
-    const store = tx.objectStore(STORE_CACHE);
-
-    const getReq = store.get('current_session');
-    getReq.onsuccess = () => {
-      if (getReq.result) {
-        const existing: CachedSessionData = getReq.result;
-        existing.stockSearchState = searchState;
-        existing.savedAt = Date.now();
-        store.put(existing);
-      }
-    };
-  } catch (err) {
-    console.warn('Failed to persist stock search in browser storage:', err);
-  }
+  // In-memory session: deliberate no-op for fresh start on reload
 }
 
 /**
@@ -194,10 +155,11 @@ export async function loadSessionFromStorage(): Promise<{
       req.onsuccess = () => {
         const data = req.result as CachedSessionData | undefined;
         if (data) {
+          // Stock report always starts completely fresh on reload as requested
           resolve({
-            stockItems: data.stockItems || [],
-            stockFileInfo: data.stockFileInfo || null,
-            stockSearchState: data.stockSearchState || null,
+            stockItems: [],
+            stockFileInfo: null,
+            stockSearchState: null,
             salesItems: data.salesItems || [],
             salesFileInfo: data.salesFileInfo || null,
             salesSearchState: data.salesSearchState || null,

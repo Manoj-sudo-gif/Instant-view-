@@ -1,4 +1,4 @@
-import { Shirt, BarChart3, Search, Database, Layers, RotateCcw } from 'lucide-react';
+import { Shirt, BarChart3, Search, Database, RotateCcw } from 'lucide-react';
 import { UploadedFileInfo } from '../types/inventory';
 
 interface HeaderProps {
