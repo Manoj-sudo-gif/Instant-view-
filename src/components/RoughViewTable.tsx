@@ -29,6 +29,7 @@ import {
 import {
   exportToonLabelExcel,
   exportEanExcel,
+  exportShuffledMatrixExcel,
   generateToonLabelMatrix,
   formatStoreDisplayName,
   compareColourAndSize,
@@ -227,6 +228,12 @@ export function RoughViewTable({
     }
   };
 
+  // Shuffled / Manual Shuffle Excel download handler (includes UI lent/bought details + Final Prediction Matrix)
+  const handleDownloadShuffledExcel = () => {
+    if (shuffledResult.shuffledRows.length === 0 || shuffleMode === 'off') return;
+    exportShuffledMatrixExcel(shuffledResult.shuffledRows, searchState.query, shuffleMode);
+  };
+
   // Filter items based on store card and search text
   const filteredItems = useMemo(() => {
     let result = [...items];
@@ -371,14 +378,9 @@ export function RoughViewTable({
     );
   }, [manualTransfersMap]);
 
-  // Available stock helper for donor store in a row (accounting for already assigned transfers in that row)
-  const getAvailableStock = (row: ToonMatrixRow, storeKey: MatrixStoreKey): number => {
-    const rowKey = `${row.colour}__${row.toonLabel}__${row.size}`;
-    const rowTransfers = manualTransfersMap[rowKey] || [];
-    const donated = rowTransfers
-      .filter((t) => t.fromStore === storeKey)
-      .reduce((acc, t) => acc + t.qty, 0);
-    return Math.max(0, row[storeKey] - donated);
+  // Available stock helper for donor store in a shuffled row (post-transfer count, allows lending down to 0)
+  const getAvailableStock = (row: ShuffledMatrixRow, storeKey: MatrixStoreKey): number => {
+    return Math.max(0, row[storeKey]);
   };
 
   // Remove a manual transfer
@@ -539,10 +541,10 @@ export function RoughViewTable({
     const cellInfo = shuffledRow.cellInfo[storeKey];
     const orig = cellInfo.originalQty;
     const hasBorrowed = cellInfo.borrowedDetails.length > 0;
-    const hasLent = cellInfo.donatedCount > 0;
+    const hasLent = cellInfo.donatedToStores.length > 0;
 
-    // Case 1: Received / Borrowed stock (e.g. was 0, now +1 from KR)
-    if (hasBorrowed) {
+    // Case 1 & 2: Received / Borrowed and/or Lent stock (shows exact UI badges matching transfers)
+    if (hasBorrowed || hasLent) {
       return (
         <div className="flex flex-col items-end gap-1">
           {cellInfo.borrowedDetails.map((b, bIdx) => (
@@ -562,25 +564,17 @@ export function RoughViewTable({
               </span>
             </div>
           ))}
-        </div>
-      );
-    }
-
-    // Case 2: Lent / Donated stock to other stores (can donate 1 or multiple times)
-    if (hasLent) {
-      return (
-        <div className="flex flex-col items-end gap-1">
           {cellInfo.donatedToStores.map((d, dIdx) => (
             <div
               key={`d-${dIdx}`}
               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-50 text-slate-800 border border-amber-300 font-bold shadow-2xs"
-              title={`Original: ${orig} -> Sent 1 unit to ${d.name} (${d.shortcut})`}
+              title={`Original: ${orig} -> Sent ${d.qty} unit(s) to ${d.name} (${d.shortcut})`}
             >
               <span className="text-[11px] text-slate-500 font-medium">
                 {orig}
               </span>
               <span className="text-xs text-amber-700 font-black bg-amber-100 px-1 py-0.2 rounded border border-amber-200">
-                [-1]
+                [-{d.qty}]
               </span>
               <span className="text-[9.5px] px-1 py-0.2 rounded bg-amber-200/90 text-amber-900 font-bold uppercase tracking-tight">
                 &rarr; {d.shortcut}
@@ -1487,6 +1481,23 @@ export function RoughViewTable({
                     <span>Hide Shuffled Matrix</span>
                   </button>
                 )}
+
+                {/* DOWNLOAD SHUFFLED / MANUAL SHUFFLE EXCEL BUTTON */}
+                {shuffleMode !== 'off' && (
+                  <button
+                    type="button"
+                    id="btn-download-shuffled-excel-top"
+                    onClick={handleDownloadShuffledExcel}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 active:scale-95 text-white font-bold text-xs shadow-xs transition-all cursor-pointer"
+                    title="Download Excel with Stock Lent, Bought/Received details & Final Prediction Matrix"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>
+                      {shuffleMode === 'manual' ? 'Download Manual Shuffle' : 'Download Shuffled Excel'}
+                    </span>
+                    <Download className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
 
               {/* STATUS INDICATORS & QUICK MANUAL ACTIONS */}
@@ -1555,7 +1566,7 @@ export function RoughViewTable({
                     </span>
                   </h3>
                 </div>
-                <div className="flex flex-wrap items-center gap-3 text-xs">
+                <div className="flex flex-wrap items-center gap-2.5 text-xs">
                   <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-purple-100 text-purple-900 font-bold border border-purple-300">
                     <span>0</span>
                     <span className="text-purple-700 font-black">[+1] KR</span>
@@ -1566,6 +1577,19 @@ export function RoughViewTable({
                     <span className="text-amber-700 font-black">[-1] &rarr; SLM</span>
                     <span className="text-[10px] text-amber-700 font-normal">&rarr; Lent</span>
                   </span>
+                  <button
+                    type="button"
+                    id="btn-download-shuffled-excel"
+                    onClick={handleDownloadShuffledExcel}
+                    className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-purple-700 hover:bg-purple-800 active:scale-95 text-white text-xs font-bold shadow-xs transition-all cursor-pointer"
+                    title="Download Excel matching all UI lent & bought transfer details"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>
+                      {shuffleMode === 'manual' ? 'Download Manual Excel' : 'Download Shuffled Excel'}
+                    </span>
+                    <Download className="w-3.5 h-3.5" />
+                  </button>
                 </div>
               </div>
 
@@ -1749,6 +1773,8 @@ export function RoughViewTable({
                                         onChange={(e) => {
                                           const val = e.target.value as MatrixStoreKey;
                                           setNewTransferFrom(val);
+                                          const maxAvail = getAvailableStock(row, val);
+                                          setNewTransferQty((q) => Math.max(1, Math.min(q, maxAvail || 1)));
                                           if (newTransferTo === val) {
                                             const alt = ALL_STORE_KEYS.find((k) => k !== val) || '';
                                             setNewTransferTo(alt);

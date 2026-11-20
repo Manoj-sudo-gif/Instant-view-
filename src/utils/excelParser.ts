@@ -1,6 +1,7 @@
 import {
   XLSX,
   styleMatrixWorksheet,
+  styleShuffledMatrixWorksheet,
   styleDetailedWorksheet,
   calculateColumnWidths,
   MatrixColorGroup,
@@ -12,6 +13,12 @@ import {
   TOON_EXCEL_STORES,
   ToonMatrixRow,
 } from '../types/inventory';
+import {
+  ShuffledMatrixRow,
+  StoreCellShuffleInfo,
+  MatrixStoreKey,
+  STORE_SHORTCUTS,
+} from './stockShuffle';
 import { SAMPLE_WONDERSOFT_DATA } from './sampleData';
 
 /**
@@ -1217,6 +1224,240 @@ export function exportToonLabelExcel(
 
   const safeQuery = searchQuery.replace(/[^a-zA-Z0-9_-]/g, '_');
   const filename = `GM_Fashion_Toon_${safeQuery || 'Results'}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+
+  XLSX.writeFile(workbook, filename);
+  return filename;
+}
+
+function formatShuffledCellForExcel(info: StoreCellShuffleInfo): string | number {
+  const lines: string[] = [];
+
+  if (info.borrowedDetails && info.borrowedDetails.length > 0) {
+    for (const b of info.borrowedDetails) {
+      lines.push(`${info.originalQty} [+${b.qty}] ${b.sourceShortcut}`);
+    }
+  }
+
+  if (info.donatedToStores && info.donatedToStores.length > 0) {
+    for (const d of info.donatedToStores) {
+      lines.push(`${info.originalQty} [-${d.qty}] → ${d.shortcut}`);
+    }
+  }
+
+  if (lines.length > 0) {
+    return lines.join('\n');
+  }
+
+  return info.shuffledQty;
+}
+
+const MATRIX_STORE_ORDER: MatrixStoreKey[] = [
+  'kootapalli',
+  'karur',
+  'salem',
+  'namakkal',
+  'kumbakonam',
+  'thiruvannamalai',
+  'mallur',
+  'gmFashionsWarehouse',
+];
+
+function formatRowTransferSummary(row: ShuffledMatrixRow): string {
+  const movements: string[] = [];
+  for (const storeKey of MATRIX_STORE_ORDER) {
+    const info = row.cellInfo[storeKey];
+    if (info && info.borrowedDetails) {
+      for (const b of info.borrowedDetails) {
+        movements.push(`${b.sourceShortcut} → ${STORE_SHORTCUTS[storeKey]} (+${b.qty})`);
+      }
+    }
+  }
+  return movements.length > 0 ? movements.join(', ') : '—';
+}
+
+/**
+ * Downloads a 2-sheet styled Excel workbook for Auto Shuffle or Manual Shuffle:
+ * 1. "Shuffled Action Matrix": exact UI lent/bought details (e.g. "0 [+1] KR", "3 [-1] -> SLM") + Transfer Movements column
+ * 2. "Final Prediction Matrix": clean post-shuffle numeric target inventory per store
+ */
+export function exportShuffledMatrixExcel(
+  shuffledRows: ShuffledMatrixRow[],
+  searchQuery: string,
+  shuffleMode: 'auto' | 'manual'
+): string {
+  // Build color groups matching UI row merges
+  const groups: MatrixColorGroup[] = [];
+  let currentGroup: MatrixColorGroup | null = null;
+  const groupStartIndices = new Set<number>();
+
+  shuffledRows.forEach((row, idx) => {
+    const key = `${(row.toonLabel || '').trim()}___${(row.colour || '').trim()}`;
+    const prevKey = currentGroup
+      ? `${currentGroup.toonLabel.trim()}___${currentGroup.colour.trim()}`
+      : '';
+
+    if (!currentGroup || key !== prevKey) {
+      currentGroup = {
+        colour: row.colour,
+        toonLabel: row.toonLabel,
+        startIndex: idx,
+        endIndex: idx,
+        count: 1,
+      };
+      groups.push(currentGroup);
+      groupStartIndices.add(idx);
+    } else {
+      currentGroup.endIndex = idx;
+      currentGroup.count++;
+    }
+  });
+
+  // Sheet 1: Shuffled Action Matrix (UI lent / bought details)
+  const actionHeaders = [
+    'Color',
+    'Toon Label',
+    'Size',
+    'Kootapalli',
+    'Karur',
+    'Salem',
+    'Namakkal',
+    'Kumbakonam',
+    'Thiruvannamalai',
+    'Mallur',
+    'GM Fashions Warehouse',
+    'Size Total',
+    'Transfer Movements',
+  ];
+
+  const actionData: Record<string, string | number>[] = shuffledRows.map((row, idx) => ({
+    'Color': groupStartIndices.has(idx) ? row.colour : '',
+    'Toon Label': groupStartIndices.has(idx) ? row.toonLabel : '',
+    'Size': row.size,
+    'Kootapalli': formatShuffledCellForExcel(row.cellInfo.kootapalli),
+    'Karur': formatShuffledCellForExcel(row.cellInfo.karur),
+    'Salem': formatShuffledCellForExcel(row.cellInfo.salem),
+    'Namakkal': formatShuffledCellForExcel(row.cellInfo.namakkal),
+    'Kumbakonam': formatShuffledCellForExcel(row.cellInfo.kumbakonam),
+    'Thiruvannamalai': formatShuffledCellForExcel(row.cellInfo.thiruvannamalai),
+    'Mallur': formatShuffledCellForExcel(row.cellInfo.mallur),
+    'GM Fashions Warehouse': formatShuffledCellForExcel(row.cellInfo.gmFashionsWarehouse),
+    'Size Total': row.sizeTotal,
+    'Transfer Movements': formatRowTransferSummary(row),
+  }));
+
+  const totals = shuffledRows.reduce(
+    (acc, r) => {
+      acc.Kootapalli += r.kootapalli;
+      acc.Karur += r.karur;
+      acc.Salem += r.salem;
+      acc.Namakkal += r.namakkal;
+      acc.Kumbakonam += r.kumbakonam;
+      acc.Thiruvannamalai += r.thiruvannamalai;
+      acc.Mallur += r.mallur;
+      acc.Warehouse += r.gmFashionsWarehouse;
+      acc.SizeTotal += r.sizeTotal;
+      acc.MovedUnits += r.totalRedirectedInRow;
+      return acc;
+    },
+    {
+      Kootapalli: 0,
+      Karur: 0,
+      Salem: 0,
+      Namakkal: 0,
+      Kumbakonam: 0,
+      Thiruvannamalai: 0,
+      Mallur: 0,
+      Warehouse: 0,
+      SizeTotal: 0,
+      MovedUnits: 0,
+    }
+  );
+
+  if (actionData.length > 0) {
+    actionData.push({
+      'Color': 'SHUFFLED TOTAL',
+      'Toon Label': '-',
+      'Size': '-',
+      'Kootapalli': totals.Kootapalli,
+      'Karur': totals.Karur,
+      'Salem': totals.Salem,
+      'Namakkal': totals.Namakkal,
+      'Kumbakonam': totals.Kumbakonam,
+      'Thiruvannamalai': totals.Thiruvannamalai,
+      'Mallur': totals.Mallur,
+      'GM Fashions Warehouse': totals.Warehouse,
+      'Size Total': totals.SizeTotal,
+      'Transfer Movements': `${totals.MovedUnits} units moved`,
+    });
+  }
+
+  const actionWorksheet = XLSX.utils.json_to_sheet(actionData, { header: actionHeaders });
+  actionWorksheet['!cols'] = calculateColumnWidths(actionHeaders, actionData);
+  styleShuffledMatrixWorksheet(actionWorksheet, actionHeaders, actionData.length, groups);
+
+  // Sheet 2: Final Prediction Matrix (Clean Target Stocks)
+  const predHeaders = [
+    'Color',
+    'Toon Label',
+    'Size',
+    'Kootapalli',
+    'Karur',
+    'Salem',
+    'Namakkal',
+    'Kumbakonam',
+    'Thiruvannamalai',
+    'Mallur',
+    'GM Fashions Warehouse',
+    'Size Total',
+  ];
+
+  const predData: Record<string, string | number>[] = shuffledRows.map((row, idx) => ({
+    'Color': groupStartIndices.has(idx) ? row.colour : '',
+    'Toon Label': groupStartIndices.has(idx) ? row.toonLabel : '',
+    'Size': row.size,
+    'Kootapalli': row.kootapalli,
+    'Karur': row.karur,
+    'Salem': row.salem,
+    'Namakkal': row.namakkal,
+    'Kumbakonam': row.kumbakonam,
+    'Thiruvannamalai': row.thiruvannamalai,
+    'Mallur': row.mallur,
+    'GM Fashions Warehouse': row.gmFashionsWarehouse,
+    'Size Total': row.sizeTotal,
+  }));
+
+  if (predData.length > 0) {
+    predData.push({
+      'Color': 'PREDICTED TOTAL',
+      'Toon Label': '-',
+      'Size': '-',
+      'Kootapalli': totals.Kootapalli,
+      'Karur': totals.Karur,
+      'Salem': totals.Salem,
+      'Namakkal': totals.Namakkal,
+      'Kumbakonam': totals.Kumbakonam,
+      'Thiruvannamalai': totals.Thiruvannamalai,
+      'Mallur': totals.Mallur,
+      'GM Fashions Warehouse': totals.Warehouse,
+      'Size Total': totals.SizeTotal,
+    });
+  }
+
+  const predWorksheet = XLSX.utils.json_to_sheet(predData, { header: predHeaders });
+  predWorksheet['!cols'] = calculateColumnWidths(predHeaders, predData);
+  styleMatrixWorksheet(predWorksheet, predHeaders, predData.length, 'stock', groups);
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    workbook,
+    actionWorksheet,
+    shuffleMode === 'manual' ? 'Manual Shuffle Actions' : 'Shuffled Action Matrix'
+  );
+  XLSX.utils.book_append_sheet(workbook, predWorksheet, 'Final Prediction Matrix');
+
+  const safeQuery = searchQuery.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const modeTag = shuffleMode === 'manual' ? 'Manual_Shuffle' : 'Auto_Shuffle';
+  const filename = `GM_Fashion_${modeTag}_${safeQuery || 'Results'}_${new Date().toISOString().slice(0, 10)}.xlsx`;
 
   XLSX.writeFile(workbook, filename);
   return filename;

@@ -75,7 +75,7 @@ export interface StoreCellShuffleInfo {
   sourceStoreName?: string;
   donatedCount: number;
   borrowedDetails: BorrowDetail[];
-  donatedToStores: { storeKey: MatrixStoreKey; shortcut: string; name: string }[];
+  donatedToStores: { storeKey: MatrixStoreKey; shortcut: string; name: string; qty: number }[];
 }
 
 export interface ShuffledMatrixRow extends ToonMatrixRow {
@@ -90,11 +90,10 @@ export interface ShuffledMatrixRow extends ToonMatrixRow {
  * Rules:
  * 1. Identify stores that have 0 stock.
  * 2. Process zero-stock stores in order of user's recipient preference:
- *    Mallur -> Thiruvannamalai -> Kumbakonam -> Karur -> Salem -> Namakkal -> Koottappalli.
- * 3. Donors are stores with excess stock (current count >= 2).
- *    To keep stocks balanced across all stores, the donor with the HIGHEST current stock donates first.
- *    If tied, GM Fashions Warehouse (GMW) or stores with lower recipient preference donate first.
- * 4. 1 unit is transferred from the donor to the recipient.
+ *    Koottappalli -> Salem -> Namakkal -> Karur -> Thiruvannamalai -> Kumbakonam -> Mallur.
+ * 3. Donors are preferred first from stores with excess stock (current count >= 2), highest stock first.
+ * 4. If no >= 2 donor exists, stores with 1 stock (GM Fashions Warehouse or lower-priority stores)
+ *    can lend their remaining 1 unit down to 0 so high-priority 0-stock stores get filled.
  * 5. Size Total remains strictly conserved.
  */
 export function shuffleMatrixRow(row: ToonMatrixRow): ShuffledMatrixRow {
@@ -136,8 +135,10 @@ export function shuffleMatrixRow(row: ToonMatrixRow): ShuffledMatrixRow {
   // Process 0-stock stores according to recipient preference
   for (const recipientKey of RECIPIENT_PREFERENCE) {
     if (currentStocks[recipientKey] === 0) {
-      // Find candidate donors with excess stock (>= 2)
-      const candidateDonors = allPossibleDonors
+      const recipientPrefIdx = RECIPIENT_PREFERENCE.indexOf(recipientKey);
+
+      // Tier 1: Candidate donors with excess stock (>= 2)
+      let candidateDonors = allPossibleDonors
         .filter((k) => k !== recipientKey && currentStocks[k] >= 2)
         .sort((a, b) => {
           // 1. Highest stock first (to keep stocks balanced across all stores)
@@ -152,6 +153,21 @@ export function shuffleMatrixRow(row: ToonMatrixRow): ShuffledMatrixRow {
           const idxB = RECIPIENT_PREFERENCE.indexOf(b);
           return idxB - idxA;
         });
+
+      // Tier 2: Allow lending down to 0 when only 1 stock remains in GMW or a lower-priority shop
+      if (candidateDonors.length === 0) {
+        candidateDonors = allPossibleDonors
+          .filter((k) => {
+            if (k === recipientKey || currentStocks[k] < 1) return false;
+            if (k === 'gmFashionsWarehouse') return true;
+            return RECIPIENT_PREFERENCE.indexOf(k) > recipientPrefIdx;
+          })
+          .sort((a, b) => {
+            if (a === 'gmFashionsWarehouse') return -1;
+            if (b === 'gmFashionsWarehouse') return 1;
+            return RECIPIENT_PREFERENCE.indexOf(b) - RECIPIENT_PREFERENCE.indexOf(a);
+          });
+      }
 
       if (candidateDonors.length > 0) {
         const donorKey = candidateDonors[0];
@@ -178,6 +194,7 @@ export function shuffleMatrixRow(row: ToonMatrixRow): ShuffledMatrixRow {
           storeKey: recipientKey,
           shortcut: STORE_SHORTCUTS[recipientKey],
           name: STORE_FULL_NAMES[recipientKey],
+          qty: 1,
         });
 
         totalRedirectedInRow += 1;
@@ -280,6 +297,7 @@ export function applyManualTransfersToMatrixRow(
       storeKey: t.toStore,
       shortcut: STORE_SHORTCUTS[t.toStore],
       name: STORE_FULL_NAMES[t.toStore],
+      qty: qty,
     });
 
     totalRedirectedInRow += qty;

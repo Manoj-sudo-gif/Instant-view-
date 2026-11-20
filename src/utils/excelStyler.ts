@@ -292,12 +292,14 @@ export function calculateColumnWidths(
 ): { wch: number }[] {
   return headers.map((header) => {
     let maxLen = header.length;
-    for (let i = 0; i < Math.min(rows.length, 100); i++) {
+    for (let i = 0; i < Math.min(rows.length, 250); i++) {
       const val = rows[i]?.[header];
       if (val !== null && val !== undefined) {
-        const str = String(val);
-        if (str.length > maxLen) {
-          maxLen = Math.min(str.length, 45); // cap at 45
+        const lines = String(val).split('\n');
+        for (const line of lines) {
+          if (line.length > maxLen) {
+            maxLen = Math.min(line.length, 55); // cap at 55
+          }
         }
       }
     }
@@ -307,6 +309,7 @@ export function calculateColumnWidths(
     if (header === 'Toon Label') return { wch: Math.max(maxLen + 4, 18) };
     if (header === 'Size') return { wch: Math.max(maxLen + 4, 10) };
     if (header.includes('Total')) return { wch: Math.max(maxLen + 4, 14) };
+    if (header === 'Transfer Movements') return { wch: Math.max(maxLen + 4, 24) };
 
     return { wch: Math.max(maxLen + 4, 14) };
   });
@@ -655,6 +658,259 @@ export function styleDetailedWorksheet(
       }
     }
   }
+}
+
+/**
+ * Styles the Shuffled / Manual Transfer Action Matrix Worksheet
+ * Visually mirrors the UI badges:
+ * - Borrowed/Received cells (e.g. "0 [+1] KR") -> Purple badge highlight
+ * - Lent cells (e.g. "3 [-1] -> SLM") -> Amber badge highlight
+ * - Mixed Borrowed + Lent cells -> Indigo badge highlight
+ * - Untouched positive stock -> Emerald green highlight
+ * - Zero stock -> Subtle muted gray
+ * Supports multiline cell values with automatic row height sizing and Color/Toon merges.
+ */
+export function styleShuffledMatrixWorksheet(
+  worksheet: XLSX.WorkSheet,
+  headers: string[],
+  rowCount: number,
+  groups: MatrixColorGroup[] = []
+) {
+  const headerBg = '4C1D95'; // Deep Purple matching UI Shuffled Matrix
+  const headerText = 'FFFFFF';
+  const summaryRowBg = 'EDE9FE'; // Soft Purple for SHUFFLED TOTAL row
+  const summaryRowText = '4C1D95';
+
+  const totalCols = headers.length;
+  const sizeTotalColIdx = headers.indexOf('Size Total');
+  const movementsColIdx = headers.indexOf('Transfer Movements');
+  const storeEndColIdx = sizeTotalColIdx !== -1 ? sizeTotalColIdx : totalCols - 1;
+
+  // Row heights (header + dynamic row heights for multiline cells)
+  const rowHeights: XLSX.RowInfo[] = [{ hpt: 30 }];
+
+  // Configure SheetJS cell merges for Color (col 0) and Toon Label (col 1)
+  const merges: XLSX.Range[] = [];
+  const rowGroupMap = new Map<
+    number,
+    { group: MatrixColorGroup; groupIndex: number; theme: ColorGroupTheme }
+  >();
+
+  groups.forEach((g, gIdx) => {
+    const groupTheme = getColorGroupTheme(g.colour, gIdx);
+    const startRow = g.startIndex + 1;
+    const endRow = g.endIndex + 1;
+
+    if (endRow > startRow) {
+      merges.push({ s: { r: startRow, c: 0 }, e: { r: endRow, c: 0 } });
+      merges.push({ s: { r: startRow, c: 1 }, e: { r: endRow, c: 1 } });
+    }
+
+    for (let rIdx = g.startIndex; rIdx <= g.endIndex; rIdx++) {
+      rowGroupMap.set(rIdx, { group: g, groupIndex: gIdx, theme: groupTheme });
+    }
+  });
+
+  if (merges.length > 0) {
+    worksheet['!merges'] = merges;
+  }
+
+  for (let r = 0; r <= rowCount; r++) {
+    const isHeader = r === 0;
+    const isSummaryRow = r === rowCount && rowCount > 1;
+    const dataRowIdx = r - 1;
+    const groupInfo = rowGroupMap.get(dataRowIdx);
+    const isFirstInGroup = groupInfo ? dataRowIdx === groupInfo.group.startIndex : false;
+    const isLastInGroup = groupInfo ? dataRowIdx === groupInfo.group.endIndex : false;
+    const currentTheme = groupInfo?.theme || ROTATING_PALETTES[0];
+
+    let maxLinesInRow = 1;
+
+    for (let c = 0; c < totalCols; c++) {
+      const cellRef = XLSX.utils.encode_cell({ r, c });
+      let cell = worksheet[cellRef];
+
+      if (!cell) {
+        cell = { t: 's', v: '' };
+        worksheet[cellRef] = cell;
+      }
+
+      const strVal = cell.v !== undefined && cell.v !== null ? String(cell.v) : '';
+      if (!isHeader && strVal.includes('\n')) {
+        const lineCount = strVal.split('\n').length;
+        if (lineCount > maxLinesInRow) maxLinesInRow = lineCount;
+      }
+
+      const isColorCol = c === 0;
+      const isToonCol = c === 1;
+      const isSizeCol = c === 2;
+      const isStoreCol = c >= 3 && c < storeEndColIdx;
+      const isTotalCol = c === sizeTotalColIdx;
+      const isMovementsCol = c === movementsColIdx;
+
+      const borderTop = isFirstInGroup
+        ? { style: 'medium', color: { rgb: currentTheme.borderColor || '7C3AED' } }
+        : BORDER_THIN.top;
+      const borderBottom = isLastInGroup
+        ? { style: 'medium', color: { rgb: currentTheme.borderColor || '7C3AED' } }
+        : BORDER_THIN.bottom;
+
+      if (isHeader) {
+        cell.s = {
+          fill: { fgColor: { rgb: headerBg } },
+          font: { name: 'Arial', sz: 11, bold: true, color: { rgb: headerText } },
+          alignment: {
+            horizontal: isColorCol || isToonCol ? 'left' : isStoreCol || isTotalCol || isSizeCol ? 'center' : 'left',
+            vertical: 'center',
+            wrapText: true,
+          },
+          border: BORDER_THIN,
+        };
+      } else if (isSummaryRow) {
+        cell.s = {
+          fill: { fgColor: { rgb: summaryRowBg } },
+          font: { name: 'Arial', sz: 11, bold: true, color: { rgb: summaryRowText } },
+          alignment: {
+            horizontal: c === 0 ? 'left' : 'center',
+            vertical: 'center',
+          },
+          border: BORDER_TOTAL,
+        };
+      } else if (isColorCol) {
+        cell.s = {
+          fill: { fgColor: { rgb: currentTheme.badgeBg } },
+          font: { name: 'Arial', sz: 12, bold: true, color: { rgb: currentTheme.badgeText } },
+          alignment: { horizontal: 'center', vertical: 'center', wrapText: true },
+          border: {
+            top: borderTop,
+            bottom: borderBottom,
+            left: { style: 'medium', color: { rgb: currentTheme.borderColor || '7C3AED' } },
+            right: { style: 'thin', color: { rgb: 'CBD5E1' } },
+          },
+        };
+      } else if (isToonCol) {
+        cell.s = {
+          fill: { fgColor: { rgb: 'F3E8FF' } },
+          font: { name: 'Arial', sz: 11, bold: true, color: { rgb: '581C87' } },
+          alignment: { horizontal: 'center', vertical: 'center', wrapText: true },
+          border: {
+            top: borderTop,
+            bottom: borderBottom,
+            left: BORDER_THIN.left,
+            right: { style: 'thin', color: { rgb: 'CBD5E1' } },
+          },
+        };
+      } else if (isSizeCol) {
+        const isEven = dataRowIdx % 2 === 0;
+        cell.s = {
+          fill: { fgColor: { rgb: isEven ? currentTheme.rowBg : currentTheme.rowAltBg } },
+          font: { name: 'Arial', sz: 11, bold: true, color: { rgb: '0F172A' } },
+          alignment: { horizontal: 'center', vertical: 'center' },
+          border: {
+            top: borderTop,
+            bottom: borderBottom,
+            left: BORDER_THIN.left,
+            right: BORDER_THIN.right,
+          },
+        };
+      } else if (isTotalCol) {
+        cell.s = {
+          fill: { fgColor: { rgb: 'EDE9FE' } },
+          font: { name: 'Arial', sz: 11, bold: true, color: { rgb: '4C1D95' } },
+          alignment: { horizontal: 'center', vertical: 'center' },
+          border: {
+            top: borderTop,
+            bottom: borderBottom,
+            left: BORDER_THIN.left,
+            right: { style: 'medium', color: { rgb: currentTheme.borderColor || '7C3AED' } },
+          },
+        };
+      } else if (isMovementsCol) {
+        const hasMovements = strVal !== '' && strVal !== '—' && strVal !== '-';
+        cell.s = {
+          fill: { fgColor: { rgb: hasMovements ? 'FAF5FF' : 'FFFFFF' } },
+          font: {
+            name: 'Arial',
+            sz: 10,
+            bold: hasMovements,
+            color: { rgb: hasMovements ? '6B21A8' : EXCEL_COLORS.textMuted },
+          },
+          alignment: { horizontal: 'left', vertical: 'center', wrapText: true },
+          border: {
+            top: borderTop,
+            bottom: borderBottom,
+            left: BORDER_THIN.left,
+            right: { style: 'medium', color: { rgb: currentTheme.borderColor || '7C3AED' } },
+          },
+        };
+      } else if (isStoreCol) {
+        const isEven = dataRowIdx % 2 === 0;
+        let cellBg = isEven ? currentTheme.rowBg : currentTheme.rowAltBg;
+        let fontColor = EXCEL_COLORS.textRegular;
+        let isBold = false;
+        let cellBorder: typeof BORDER_THIN = {
+          top: borderTop,
+          bottom: borderBottom,
+          left: BORDER_THIN.left,
+          right: BORDER_THIN.right,
+        };
+
+        const hasBorrowedBadge = strVal.includes('[+');
+        const hasLentBadge = strVal.includes('[-');
+
+        if (hasBorrowedBadge && hasLentBadge) {
+          // Mixed received + lent cell
+          cellBg = 'E0E7FF';
+          fontColor = '3730A3';
+          isBold = true;
+        } else if (hasBorrowedBadge) {
+          // Received / Bought cell -> Purple badge matching UI
+          cellBg = 'F3E8FF';
+          fontColor = '6B21A8';
+          isBold = true;
+          cellBorder = {
+            top: { style: 'thin', color: { rgb: 'A855F7' } },
+            bottom: { style: 'thin', color: { rgb: 'A855F7' } },
+            left: { style: 'thin', color: { rgb: 'A855F7' } },
+            right: { style: 'thin', color: { rgb: 'A855F7' } },
+          };
+        } else if (hasLentBadge) {
+          // Lent / Donated cell -> Amber badge matching UI
+          cellBg = 'FEF3C7';
+          fontColor = '92400E';
+          isBold = true;
+          cellBorder = {
+            top: { style: 'thin', color: { rgb: 'F59E0B' } },
+            bottom: { style: 'thin', color: { rgb: 'F59E0B' } },
+            left: { style: 'thin', color: { rgb: 'F59E0B' } },
+            right: { style: 'thin', color: { rgb: 'F59E0B' } },
+          };
+        } else {
+          const numVal = typeof cell.v === 'number' ? cell.v : parseFloat(strVal);
+          if (!isNaN(numVal) && numVal > 0) {
+            cellBg = EXCEL_COLORS.stockQtyPositiveBg;
+            fontColor = EXCEL_COLORS.stockQtyPositiveText;
+            isBold = true;
+          } else {
+            fontColor = EXCEL_COLORS.textMuted;
+          }
+        }
+
+        cell.s = {
+          fill: { fgColor: { rgb: cellBg } },
+          font: { name: 'Arial', sz: 10, bold: isBold, color: { rgb: fontColor } },
+          alignment: { horizontal: 'center', vertical: 'center', wrapText: true },
+          border: cellBorder,
+        };
+      }
+    }
+
+    if (!isHeader) {
+      rowHeights.push({ hpt: isSummaryRow ? 26 : Math.max(22, maxLinesInRow * 16 + 6) });
+    }
+  }
+
+  worksheet['!rows'] = rowHeights;
 }
 
 export { XLSX };
