@@ -18,8 +18,15 @@ import {
   tryMatchStoreName,
   formatStoreDisplayName,
   findHeaderRowIndex,
+  findHeaderRowIndexFromRows,
   compareToonColourAndSize,
 } from './excelParser';
+import { MAX_FILE_UPLOAD_BYTES, formatByteSize } from './storage';
+import {
+  ParseProgress,
+  streamCsvFileInBatches,
+  yieldToMainThread,
+} from './streamingCsvParser';
 
 function cleanNumber(val: unknown, defaultVal = 0): number {
   if (val === null || val === undefined || val === '') return defaultVal;
@@ -242,19 +249,399 @@ function extractStoreFromPreHeader(rawRows: unknown[][], headerRowIdx: number): 
   return candidateWarehouse;
 }
 
+interface SalesSheetContext {
+  sheetName: string;
+  headers: string[];
+  qtyColIdx: number;
+  toonColIdx: number;
+  storeColIdx: number;
+  storeCandidateColIndices: number[];
+  toonFallbackIdx: number;
+  colourIdx: number;
+  sizeIdx: number;
+  productNameIdx: number;
+  brandIdx: number;
+  eanIdx: number;
+  mrpIdx: number;
+  billNoIdx: number;
+  dateIdx: number;
+  sheetLevelStore: StoreName | null;
+  storeColIndices: { store: StoreName; colIndex: number; displayName: string }[];
+  retailStoreCols: { store: StoreName; colIndex: number; displayName: string }[];
+  isWideFormat: boolean;
+}
+
+function buildSalesSheetContext(
+  sheetName: string,
+  headers: string[],
+  rawRowsForPreHeader: unknown[][],
+  headerRowIdx: number,
+  fileStoreMatch: StoreName | null
+): SalesSheetContext {
+  const headerIndexLookup: Record<string, number> = {};
+  headers.forEach((h, idx) => {
+    if (h) {
+      const norm = normalizeKey(h);
+      if (!(norm in headerIndexLookup)) {
+        headerIndexLookup[norm] = idx;
+      }
+    }
+  });
+
+  const findColIdx = (...keys: string[]): number => {
+    for (const k of keys) {
+      const norm = normalizeKey(k);
+      if (norm in headerIndexLookup) {
+        return headerIndexLookup[norm];
+      }
+    }
+    for (const k of keys) {
+      const norm = normalizeKey(k);
+      for (const [hNorm, cIdx] of Object.entries(headerIndexLookup)) {
+        if (hNorm.includes(norm) || norm.includes(hNorm)) {
+          return cIdx;
+        }
+      }
+    }
+    return -1;
+  };
+
+  const qtyColIdx = findQuantityColumnIndex(headers);
+  const toonColIdx = findToonLabelColumnIndex(headers);
+  const storeColIdx = findStoreColumnIndex(headers);
+  const storeCandidateColIndices = findStoreCandidateColumnIndices(headers);
+
+  const sheetStoreMatch = tryMatchStoreName(sheetName);
+  const preHeaderStoreMatch = extractStoreFromPreHeader(rawRowsForPreHeader, headerRowIdx);
+  const sheetLevelStore: StoreName | null =
+    (sheetStoreMatch && sheetStoreMatch !== 'GM Fashions Warehouse' ? sheetStoreMatch : null) ||
+    (preHeaderStoreMatch && preHeaderStoreMatch !== 'GM Fashions Warehouse' ? preHeaderStoreMatch : null) ||
+    (fileStoreMatch && fileStoreMatch !== 'GM Fashions Warehouse' ? fileStoreMatch : null) ||
+    sheetStoreMatch ||
+    preHeaderStoreMatch ||
+    fileStoreMatch;
+
+  const storeColIndices: { store: StoreName; colIndex: number; displayName: string }[] = [];
+  headers.forEach((h, idx) => {
+    const norm = normalizeKey(h);
+    if (!norm) return;
+
+    if (
+      norm.includes('toon') ||
+      norm.includes('style') ||
+      norm.includes('color') ||
+      norm.includes('colour') ||
+      norm.includes('size') ||
+      norm.includes('mrp') ||
+      norm.includes('price') ||
+      norm.includes('rate') ||
+      norm.includes('ean') ||
+      norm.includes('barcode') ||
+      norm.includes('date') ||
+      norm.includes('bill') ||
+      norm.includes('invoice') ||
+      norm.includes('itemname') ||
+      norm.includes('product') ||
+      norm.includes('dept') ||
+      norm.includes('class') ||
+      norm.includes('brand') ||
+      norm === 'total' ||
+      norm === 'totalqty' ||
+      norm === 'totalstock' ||
+      norm === 'totalquantity' ||
+      norm === 'totalsales' ||
+      norm === 'salesqty'
+    ) {
+      return;
+    }
+
+    if (
+      norm.includes('koot') ||
+      norm.includes('kooth') ||
+      norm.includes('koott') ||
+      norm.includes('kuttap') ||
+      norm.includes('kootam') ||
+      norm.includes('koottam') ||
+      norm.startsWith('ktp') ||
+      norm.includes('ktp')
+    ) {
+      storeColIndices.push({ store: 'Kootapalli', colIndex: idx, displayName: 'KOOTTAPPALLI' });
+      return;
+    }
+    if (norm.includes('kumba') || norm.includes('kumbakonam') || norm.includes('kmb')) {
+      storeColIndices.push({ store: 'Kumbakonam', colIndex: idx, displayName: 'KUMBAKONAM' });
+      return;
+    }
+    if (norm.includes('namakkal') || norm.includes('namakal') || norm.includes('nmkl')) {
+      storeColIndices.push({ store: 'Namakkal', colIndex: idx, displayName: 'NAMAKKAL' });
+      return;
+    }
+    if (norm.includes('salem') || norm.includes('slm')) {
+      storeColIndices.push({ store: 'Salem', colIndex: idx, displayName: 'SALEM' });
+      return;
+    }
+    if (norm.includes('karur') || norm.includes('krr')) {
+      storeColIndices.push({ store: 'Karur', colIndex: idx, displayName: 'KARUR' });
+      return;
+    }
+    if (norm.includes('mallur') || norm.includes('mlr')) {
+      storeColIndices.push({ store: 'Mallur', colIndex: idx, displayName: 'MALLUR' });
+      return;
+    }
+    if (norm.includes('thiru') || norm.includes('tiru') || norm.includes('tvm')) {
+      storeColIndices.push({ store: 'Thiruvannamalai', colIndex: idx, displayName: 'TIRUVANNAMALAI' });
+      return;
+    }
+
+    const isExcludedApparelOrTax =
+      norm.includes('kidswear') ||
+      norm.includes('menswear') ||
+      norm.includes('womenswear') ||
+      norm.includes('partywear') ||
+      norm.includes('innerwear') ||
+      norm.includes('nightwear') ||
+      norm.includes('footwear') ||
+      norm.includes('casualwear') ||
+      norm.includes('sportswear') ||
+      norm.includes('software') ||
+      norm.includes('hardware') ||
+      norm.includes('centraltax') ||
+      norm.includes('centralgst') ||
+      norm.includes('centralcess');
+
+    if (isExcludedApparelOrTax) return;
+
+    if (
+      norm.includes('warehouse') ||
+      norm.includes('godown') ||
+      norm.includes('gmfashionswarehouse') ||
+      norm.includes('centralwarehouse') ||
+      norm.includes('centralgodown') ||
+      norm === 'wh'
+    ) {
+      storeColIndices.push({ store: 'GM Fashions Warehouse', colIndex: idx, displayName: 'GM FASHIONS WAREHOUSE' });
+    }
+  });
+
+  const hasRowStoreColumn = storeColIdx !== -1 || storeCandidateColIndices.length > 0;
+  const retailStoreCols = storeColIndices.filter((sc) => sc.store !== 'GM Fashions Warehouse');
+  const isWideFormat = !hasRowStoreColumn && retailStoreCols.length >= 2;
+
+  return {
+    sheetName,
+    headers,
+    qtyColIdx,
+    toonColIdx,
+    storeColIdx,
+    storeCandidateColIndices,
+    toonFallbackIdx: findColIdx(
+      'toonlable',
+      'toonlabel',
+      'toon_lable',
+      'toon_label',
+      'toon',
+      'style',
+      'styleno',
+      'style_no',
+      'itemcode',
+      'designno',
+      'design',
+      'subclass',
+      'class',
+      'itemname',
+      'productname'
+    ),
+    colourIdx: findColIdx('colour', 'color', 'shade'),
+    sizeIdx: findColIdx('size', 'itemsize'),
+    productNameIdx: findColIdx('itemname', 'productname', 'department', 'dept', 'description', 'productgroup'),
+    brandIdx: findColIdx('brand', 'class', 'subclass'),
+    eanIdx: findColIdx('ean', 'barcode', 'upc', 'bcode'),
+    mrpIdx: findColIdx('mrp', 'price', 'rate', 'salerate', 'amount', 'netamount'),
+    billNoIdx: findColIdx('billno', 'invoiceno', 'bill', 'invno'),
+    dateIdx: findColIdx('billdate', 'date', 'saledate'),
+    sheetLevelStore,
+    storeColIndices,
+    retailStoreCols,
+    isWideFormat,
+  };
+}
+
+function mapSalesArrayRow(
+  row: unknown[],
+  ctx: SalesSheetContext,
+  rowIndex: number,
+  items: MappedSalesItem[],
+  uniqueToonSet: Set<string>,
+  uniqueEanSet: Set<string>
+): void {
+  if (!row || !Array.isArray(row)) return;
+  let hasContent = false;
+  for (let i = 0; i < row.length; i++) {
+    const v = row[i];
+    if (v !== '' && v !== null && v !== undefined) {
+      hasContent = true;
+      break;
+    }
+  }
+  if (!hasContent) return;
+
+  const strAt = (idx: number): string => {
+    if (idx < 0 || idx >= row.length) return '';
+    const v = row[idx];
+    return v !== undefined && v !== null ? String(v).trim() : '';
+  };
+
+  let toonLabel = ctx.toonColIdx !== -1 ? strAt(ctx.toonColIdx) : '';
+  if (!toonLabel && ctx.toonFallbackIdx !== -1) {
+    toonLabel = strAt(ctx.toonFallbackIdx);
+  }
+  if (!toonLabel) return;
+
+  uniqueToonSet.add(toonLabel);
+
+  const colour = strAt(ctx.colourIdx) || 'Assorted';
+  const size = strAt(ctx.sizeIdx) || 'Free';
+  const productName = strAt(ctx.productNameIdx) || toonLabel;
+  const brand = strAt(ctx.brandIdx) || 'GM Fashions';
+  const rawEan = strAt(ctx.eanIdx);
+  const ean = cleanEanString(rawEan);
+  if (ean) uniqueEanSet.add(ean);
+
+  const mrp = ctx.mrpIdx !== -1 ? cleanNumber(row[ctx.mrpIdx], 0) : 0;
+  const billNo = strAt(ctx.billNoIdx);
+  const date = strAt(ctx.dateIdx);
+
+  if (ctx.isWideFormat) {
+    const breakdown: Record<string, number> = {};
+    let hasAnySales = false;
+
+    for (const sc of ctx.storeColIndices) {
+      const qty = cleanNumber(row[sc.colIndex], 0);
+      if (qty > 0) {
+        breakdown[sc.displayName] = (breakdown[sc.displayName] || 0) + qty;
+        hasAnySales = true;
+
+        items.push({
+          id: `sales_${ctx.sheetName}_${rowIndex}_${sc.store}_${items.length}`,
+          toonLabel,
+          colour,
+          size,
+          productName,
+          brand,
+          ean,
+          store: sc.store,
+          salesQty: qty,
+          mrp,
+          billNo,
+          date,
+          storeBreakdown: breakdown,
+        });
+      }
+    }
+
+    if (!hasAnySales) {
+      items.push({
+        id: `sales_${ctx.sheetName}_${rowIndex}_zero_${items.length}`,
+        toonLabel,
+        colour,
+        size,
+        productName,
+        brand,
+        ean,
+        store: ctx.storeColIndices[0]?.store || 'Kootapalli',
+        salesQty: 0,
+        mrp,
+        billNo,
+        date,
+        storeBreakdown: breakdown,
+      });
+    }
+    return;
+  }
+
+  const salesQty = ctx.qtyColIdx !== -1 ? cleanNumber(row[ctx.qtyColIdx], 0) : 0;
+
+  let rowStore: StoreName | null = null;
+  let candidateWarehouse: StoreName | null = null;
+
+  if (ctx.storeColIdx !== -1) {
+    const directVal = strAt(ctx.storeColIdx);
+    if (directVal) {
+      const matched = tryMatchStoreName(directVal);
+      if (matched) {
+        if (matched !== 'GM Fashions Warehouse') {
+          rowStore = matched;
+        } else {
+          candidateWarehouse = matched;
+        }
+      }
+    }
+  }
+
+  if (!rowStore) {
+    for (const cIdx of ctx.storeCandidateColIndices) {
+      const cellStr = strAt(cIdx);
+      if (cellStr) {
+        const matched = tryMatchStoreName(cellStr);
+        if (matched) {
+          if (matched !== 'GM Fashions Warehouse') {
+            rowStore = matched;
+            break;
+          } else {
+            candidateWarehouse = matched;
+          }
+        }
+      }
+    }
+  }
+
+  if (!rowStore && ctx.sheetLevelStore && ctx.sheetLevelStore !== 'GM Fashions Warehouse') {
+    rowStore = ctx.sheetLevelStore;
+  }
+
+  if (!rowStore && ctx.retailStoreCols.length === 1) {
+    rowStore = ctx.retailStoreCols[0].store;
+  }
+
+  if (!rowStore && candidateWarehouse) {
+    rowStore = candidateWarehouse;
+  }
+
+  if (!rowStore) {
+    rowStore = 'Kootapalli';
+  }
+
+  const storeDisplay = formatStoreDisplayName(rowStore);
+
+  items.push({
+    id: `sales_${ctx.sheetName}_${rowIndex}_${items.length}`,
+    toonLabel,
+    colour,
+    size,
+    productName,
+    brand,
+    ean,
+    store: rowStore,
+    salesQty,
+    mrp,
+    billNo,
+    date,
+    storeBreakdown: { [storeDisplay]: salesQty },
+  });
+}
+
 /**
- * Parses an uploaded Sales Report Excel/CSV file from Wondersoft POS.
- * Explicitly extracts the 'Quantity' column as sales quantity.
- * Supports single-sheet or multi-sheet workbooks, and wide store matrices.
+ * Parses an uploaded Sales Report Excel/CSV file (up to 1 GB) from Wondersoft POS.
+ * Streams CSV files in 4 MB chunks and uses dense memory-saving SheetJS mode for Excel files.
  */
 export async function parseSalesExcelFile(
-  file: File
+  file: File,
+  onProgress?: (progress: ParseProgress) => void
 ): Promise<{ items: MappedSalesItem[]; fileInfo: UploadedFileInfo }> {
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: 'array' });
-
-  if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
-    throw new Error('The selected workbook has no sheets.');
+  if (file.size > MAX_FILE_UPLOAD_BYTES) {
+    throw new Error(
+      `File size (${formatByteSize(file.size)}) exceeds the 1 GB (${formatByteSize(MAX_FILE_UPLOAD_BYTES)}) maximum limit.`
+    );
   }
 
   const items: MappedSalesItem[] = [];
@@ -262,446 +649,109 @@ export async function parseSalesExcelFile(
   const uniqueEanSet = new Set<string>();
   let detectedQtyColName = 'Quantity';
 
-  // Check if filename itself contains a store name (e.g. Koottappalli_Sales.xlsx)
   const fileStoreMatch = tryMatchStoreName(file.name);
+  const lowerName = file.name.toLowerCase();
 
-  // Process sheets (supports multi-sheet store exports or single sheet)
-  for (const sheetName of workbook.SheetNames) {
-    const worksheet = workbook.Sheets[sheetName];
-    if (!worksheet || !worksheet['!ref']) continue;
+  if (lowerName.endsWith('.csv')) {
+    const headerScanBuffer: string[][] = [];
+    let ctx: SalesSheetContext | null = null;
+    let rowCounter = 0;
 
-    const rawRows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, {
-      header: 1,
-      defval: '',
-    });
-
-    if (!rawRows || rawRows.length < 2) continue;
-
-    const headerRowIdx = findHeaderRowIndex(worksheet);
-    const rawHeaderRow = (rawRows[headerRowIdx] as unknown[]) || [];
-    const headers = rawHeaderRow.map((h) => String(h || '').trim());
-
-    // Build column index lookup
-    const headerIndexLookup: Record<string, number> = {};
-    headers.forEach((h, idx) => {
-      if (h) {
-        const norm = normalizeKey(h);
-        if (!(norm in headerIndexLookup)) {
-          headerIndexLookup[norm] = idx;
+    await streamCsvFileInBatches(
+      file,
+      (batch) => {
+        if (!ctx) {
+          for (let i = 0; i < batch.length; i++) {
+            headerScanBuffer.push(batch[i]);
+          }
+          if (headerScanBuffer.length >= 2) {
+            const headerRowIdx = findHeaderRowIndexFromRows(headerScanBuffer);
+            const headers = (headerScanBuffer[headerRowIdx] || []).map((h) => String(h || '').trim());
+            ctx = buildSalesSheetContext('CSV', headers, headerScanBuffer, headerRowIdx, fileStoreMatch);
+            if (ctx.qtyColIdx !== -1 && ctx.headers[ctx.qtyColIdx]) {
+              detectedQtyColName = ctx.headers[ctx.qtyColIdx];
+            }
+            for (let r = headerRowIdx + 1; r < headerScanBuffer.length; r++) {
+              mapSalesArrayRow(headerScanBuffer[r], ctx, rowCounter++, items, uniqueToonSet, uniqueEanSet);
+            }
+            headerScanBuffer.length = 0;
+          }
+        } else {
+          for (let i = 0; i < batch.length; i++) {
+            mapSalesArrayRow(batch[i], ctx, rowCounter++, items, uniqueToonSet, uniqueEanSet);
+          }
         }
-      }
-    });
-
-    // Detect exact column indices
-    const qtyColIdx = findQuantityColumnIndex(headers);
-    const toonColIdx = findToonLabelColumnIndex(headers);
-    const storeColIdx = findStoreColumnIndex(headers);
-    const storeCandidateColIndices = findStoreCandidateColumnIndices(headers);
-
-    if (qtyColIdx !== -1 && headers[qtyColIdx]) {
-      detectedQtyColName = headers[qtyColIdx];
+      },
+      onProgress
+    );
+  } else {
+    if (onProgress) {
+      onProgress({
+        percent: 15,
+        loadedBytes: 0,
+        totalBytes: file.size,
+        rowsParsed: 0,
+        stage: 'Reading sales workbook...',
+      });
     }
 
-    // Check if sheet name indicates a specific store
-    const sheetStoreMatch = tryMatchStoreName(sheetName);
-
-    // Check pre-header rows (banner/header title rows above column headers)
-    const preHeaderStoreMatch = extractStoreFromPreHeader(rawRows, headerRowIdx);
-
-    // Determine default store for this sheet: retail store ALWAYS beats warehouse
-    const sheetLevelStore: StoreName | null =
-      (sheetStoreMatch && sheetStoreMatch !== 'GM Fashions Warehouse' ? sheetStoreMatch : null) ||
-      (preHeaderStoreMatch && preHeaderStoreMatch !== 'GM Fashions Warehouse' ? preHeaderStoreMatch : null) ||
-      (fileStoreMatch && fileStoreMatch !== 'GM Fashions Warehouse' ? fileStoreMatch : null) ||
-      sheetStoreMatch ||
-      preHeaderStoreMatch ||
-      fileStoreMatch;
-
-    // Detect wide store columns (e.g. KOOTTAPPALLI, SALEM, KARUR, etc. as separate column headers)
-    const storeColIndices: { store: StoreName; colIndex: number; displayName: string }[] = [];
-    headers.forEach((h, idx) => {
-      const norm = normalizeKey(h);
-      if (!norm) return;
-
-      // Skip non-store metadata columns
-      if (
-        norm.includes('toon') ||
-        norm.includes('style') ||
-        norm.includes('color') ||
-        norm.includes('colour') ||
-        norm.includes('size') ||
-        norm.includes('mrp') ||
-        norm.includes('price') ||
-        norm.includes('rate') ||
-        norm.includes('ean') ||
-        norm.includes('barcode') ||
-        norm.includes('date') ||
-        norm.includes('bill') ||
-        norm.includes('invoice') ||
-        norm.includes('itemname') ||
-        norm.includes('product') ||
-        norm.includes('dept') ||
-        norm.includes('class') ||
-        norm.includes('brand') ||
-        norm === 'total' ||
-        norm === 'totalqty' ||
-        norm === 'totalstock' ||
-        norm === 'totalquantity' ||
-        norm === 'totalsales' ||
-        norm === 'salesqty'
-      ) {
-        return;
-      }
-
-      // Check Kootapalli FIRST and comprehensively
-      if (
-        norm.includes('koot') ||
-        norm.includes('kooth') ||
-        norm.includes('koott') ||
-        norm.includes('kuttap') ||
-        norm.includes('kootam') ||
-        norm.includes('koottam') ||
-        norm.startsWith('ktp') ||
-        norm.includes('ktp')
-      ) {
-        storeColIndices.push({
-          store: 'Kootapalli',
-          colIndex: idx,
-          displayName: 'KOOTTAPPALLI',
-        });
-        return;
-      }
-
-      if (norm.includes('kumba') || norm.includes('kumbakonam') || norm.includes('kmb')) {
-        storeColIndices.push({ store: 'Kumbakonam', colIndex: idx, displayName: 'KUMBAKONAM' });
-        return;
-      }
-      if (norm.includes('namakkal') || norm.includes('namakal') || norm.includes('nmkl')) {
-        storeColIndices.push({ store: 'Namakkal', colIndex: idx, displayName: 'NAMAKKAL' });
-        return;
-      }
-      if (norm.includes('salem') || norm.includes('slm')) {
-        storeColIndices.push({ store: 'Salem', colIndex: idx, displayName: 'SALEM' });
-        return;
-      }
-      if (norm.includes('karur') || norm.includes('krr')) {
-        storeColIndices.push({ store: 'Karur', colIndex: idx, displayName: 'KARUR' });
-        return;
-      }
-      if (norm.includes('mallur') || norm.includes('mlr')) {
-        storeColIndices.push({ store: 'Mallur', colIndex: idx, displayName: 'MALLUR' });
-        return;
-      }
-      if (norm.includes('thiru') || norm.includes('tiru') || norm.includes('tvm')) {
-        storeColIndices.push({ store: 'Thiruvannamalai', colIndex: idx, displayName: 'TIRUVANNAMALAI' });
-        return;
-      }
-      // Exclude garment category wear terms, tax terms, software, etc. from matching as store columns
-      const isExcludedApparelOrTax =
-        norm.includes('kidswear') ||
-        norm.includes('menswear') ||
-        norm.includes('womenswear') ||
-        norm.includes('partywear') ||
-        norm.includes('innerwear') ||
-        norm.includes('nightwear') ||
-        norm.includes('footwear') ||
-        norm.includes('casualwear') ||
-        norm.includes('sportswear') ||
-        norm.includes('software') ||
-        norm.includes('hardware') ||
-        norm.includes('centraltax') ||
-        norm.includes('centralgst') ||
-        norm.includes('centralcess');
-
-      if (isExcludedApparelOrTax) {
-        return;
-      }
-
-      if (
-        norm.includes('warehouse') ||
-        norm.includes('godown') ||
-        norm.includes('gmfashionswarehouse') ||
-        norm.includes('centralwarehouse') ||
-        norm.includes('centralgodown') ||
-        norm === 'wh'
-      ) {
-        storeColIndices.push({ store: 'GM Fashions Warehouse', colIndex: idx, displayName: 'GM FASHIONS WAREHOUSE' });
-        return;
-      }
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, {
+      type: 'array',
+      dense: true,
+      cellFormula: false,
+      cellHTML: false,
+      cellNF: false,
+      cellStyles: false,
+      cellText: false,
     });
 
-    // An Excel file with a 'StoreName', 'BranchName', or 'Store' column is NEVER a wide matrix.
-    // Wide matrix format ONLY applies when there is NO row store column AND at least 2 distinct RETAIL store columns.
-    const hasRowStoreColumn = storeColIdx !== -1 || storeCandidateColIndices.length > 0;
-    const retailStoreCols = storeColIndices.filter(
-      (sc) => sc.store !== 'GM Fashions Warehouse'
-    );
-    const isWideFormat = !hasRowStoreColumn && retailStoreCols.length >= 2;
+    if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+      throw new Error('The selected workbook has no sheets.');
+    }
 
-    for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
-      const row = rawRows[r];
-      if (
-        !row ||
-        !Array.isArray(row) ||
-        row.every((c) => c === '' || c === null || c === undefined)
-      ) {
-        continue;
+    const totalSheets = workbook.SheetNames.length;
+    const BATCH_SIZE = 10000;
+
+    for (let sIdx = 0; sIdx < totalSheets; sIdx++) {
+      const sheetName = workbook.SheetNames[sIdx];
+      const worksheet = workbook.Sheets[sheetName];
+      if (!worksheet || !worksheet['!ref']) continue;
+
+      const rawRows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, {
+        header: 1,
+        defval: '',
+      });
+      const headerRowIdx = findHeaderRowIndex(worksheet);
+      // Free worksheet memory immediately
+      delete workbook.Sheets[sheetName];
+
+      if (!rawRows || rawRows.length < 2) continue;
+
+      const rawHeaderRow = (rawRows[headerRowIdx] as unknown[]) || [];
+      const headers = rawHeaderRow.map((h) => String(h || '').trim());
+      const ctx = buildSalesSheetContext(sheetName, headers, rawRows, headerRowIdx, fileStoreMatch);
+
+      if (ctx.qtyColIdx !== -1 && headers[ctx.qtyColIdx]) {
+        detectedQtyColName = headers[ctx.qtyColIdx];
       }
 
-      // Helper to get cell by header variations (exact first, then fuzzy)
-      const getVal = (...keys: string[]): string => {
-        for (const k of keys) {
-          const norm = normalizeKey(k);
-          if (norm in headerIndexLookup) {
-            const cIdx = headerIndexLookup[norm];
-            const val = row[cIdx];
-            if (val !== undefined && val !== null && String(val).trim() !== '') {
-              return String(val).trim();
-            }
-          }
-        }
-        for (const k of keys) {
-          const norm = normalizeKey(k);
-          for (const [hNorm, cIdx] of Object.entries(headerIndexLookup)) {
-            if (hNorm.includes(norm) || norm.includes(hNorm)) {
-              const val = row[cIdx];
-              if (val !== undefined && val !== null && String(val).trim() !== '') {
-                return String(val).trim();
-              }
-            }
-          }
-        }
-        return '';
-      };
-
-      // Extract Toon Label (either from direct column or fallback lookup)
-      let toonLabel = '';
-      if (toonColIdx !== -1 && row[toonColIdx] !== undefined && row[toonColIdx] !== null) {
-        toonLabel = String(row[toonColIdx]).trim();
-      }
-      if (!toonLabel) {
-        toonLabel = (
-          getVal(
-            'toonlable',
-            'toonlabel',
-            'toon_lable',
-            'toon_label',
-            'toon',
-            'style',
-            'styleno',
-            'style_no',
-            'itemcode',
-            'designno',
-            'design'
-          ) || getVal('subclass', 'class', 'itemname', 'productname')
-        ).trim();
-      }
-
-      if (!toonLabel) {
-        continue;
-      }
-
-      uniqueToonSet.add(toonLabel);
-
-      // Extract Color, Size, Brand, Product Name, EAN, MRP
-      const colour = (getVal('colour', 'color', 'shade') || 'Assorted').trim();
-      const size = (getVal('size', 'itemsize') || 'Free').trim();
-      const productName = (
-        getVal('itemname', 'productname', 'department', 'dept', 'description', 'productgroup') ||
-        toonLabel
-      ).trim();
-      const brand = (getVal('brand', 'class', 'subclass') || 'GM Fashions').trim();
-      const rawEan = getVal('ean', 'barcode', 'upc', 'bcode');
-      const ean = cleanEanString(rawEan);
-      if (ean) uniqueEanSet.add(ean);
-
-      const mrp = cleanNumber(
-        getVal('mrp', 'price', 'rate', 'salerate', 'amount', 'netamount'),
-        0
-      );
-      const billNo = getVal('billno', 'invoiceno', 'bill', 'invno');
-      const date = getVal('billdate', 'date', 'saledate');
-
-      if (isWideFormat) {
-        // Wide Format: read quantity from each store column
-        const breakdown: Record<string, number> = {};
-        let hasAnySales = false;
-
-        for (const sc of storeColIndices) {
-          const rawVal = row[sc.colIndex];
-          const qty = cleanNumber(rawVal, 0);
-          if (qty > 0) {
-            breakdown[sc.displayName] = (breakdown[sc.displayName] || 0) + qty;
-            hasAnySales = true;
-
-            items.push({
-              id: `sales_${sheetName}_${r}_${sc.store}_${items.length}`,
-              toonLabel,
-              colour,
-              size,
-              productName,
-              brand,
-              ean,
-              store: sc.store,
-              salesQty: qty,
-              mrp,
-              billNo,
-              date,
-              storeBreakdown: breakdown,
+      const dataRowCount = rawRows.length - (headerRowIdx + 1);
+      for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
+        mapSalesArrayRow(rawRows[r], ctx, r, items, uniqueToonSet, uniqueEanSet);
+        if ((r - headerRowIdx) % BATCH_SIZE === 0) {
+          if (onProgress) {
+            const sheetFrac = (sIdx + (r - headerRowIdx) / Math.max(dataRowCount, 1)) / totalSheets;
+            onProgress({
+              percent: 25 + Math.round(sheetFrac * 68),
+              loadedBytes: file.size,
+              totalBytes: file.size,
+              rowsParsed: items.length,
+              stage: `Processing ${items.length.toLocaleString()} sales rows...`,
             });
           }
+          await yieldToMainThread();
         }
-
-        if (!hasAnySales) {
-          items.push({
-            id: `sales_${sheetName}_${r}_zero_${items.length}`,
-            toonLabel,
-            colour,
-            size,
-            productName,
-            brand,
-            ean,
-            store: storeColIndices[0]?.store || 'Kootapalli',
-            salesQty: 0,
-            mrp,
-            billNo,
-            date,
-            storeBreakdown: breakdown,
-          });
-        }
-      } else {
-        // Standard Row Format: Sales Quantity extracted directly from 'Quantity' column!
-        let salesQty = 0;
-        if (qtyColIdx !== -1 && row[qtyColIdx] !== undefined && row[qtyColIdx] !== null) {
-          salesQty = cleanNumber(row[qtyColIdx], 0);
-        } else {
-          const rawQty = getVal(
-            'quantity',
-            'qty',
-            'salesquantity',
-            'salesqty',
-            'soldquantity',
-            'soldqty',
-            'billquantity',
-            'billqty',
-            'netquantity',
-            'netqty'
-          );
-          salesQty = cleanNumber(rawQty, 0);
-        }
-
-        // Determine Store for this row
-        // Retail store (especially Koottappalli) MUST take precedence over Warehouse
-        let rowStore: StoreName | null = null;
-        let candidateWarehouse: StoreName | null = null;
-
-        // 1. Direct Primary Store Column (e.g. Column B: "StoreName" having "KOOTTAPPALLI" or "MALLUR")
-        if (storeColIdx !== -1 && row[storeColIdx] !== undefined && row[storeColIdx] !== null) {
-          const directVal = String(row[storeColIdx]).trim();
-          if (directVal) {
-            const matched = tryMatchStoreName(directVal);
-            if (matched) {
-              if (matched !== 'GM Fashions Warehouse') {
-                rowStore = matched;
-              } else {
-                candidateWarehouse = matched;
-              }
-            }
-          }
-        }
-
-        // 2. Check candidate columns (branch, location, outlet, store)
-        if (!rowStore) {
-          for (const cIdx of storeCandidateColIndices) {
-            const cell = row[cIdx];
-            if (cell !== undefined && cell !== null && String(cell).trim()) {
-              const matched = tryMatchStoreName(String(cell).trim());
-              if (matched) {
-                if (matched !== 'GM Fashions Warehouse') {
-                  rowStore = matched;
-                  break; // Retail store found!
-                } else {
-                  candidateWarehouse = matched;
-                }
-              }
-            }
-          }
-        }
-
-        // 3. Check getVal for specific branch keywords first
-        if (!rowStore) {
-          const rawBranch = getVal(
-            'branch',
-            'branchname',
-            'branchdesc',
-            'branch_name',
-            'location',
-            'locationname',
-            'outlet',
-            'outletname',
-            'shop',
-            'counter'
-          );
-          if (rawBranch) {
-            const matched = tryMatchStoreName(rawBranch);
-            if (matched && matched !== 'GM Fashions Warehouse') {
-              rowStore = matched;
-            } else if (matched) {
-              candidateWarehouse = matched;
-            }
-          }
-        }
-
-        // 4. Check getVal for company/store keywords
-        if (!rowStore) {
-          const rawStore = getVal('store', 'storename', 'company', 'site');
-          if (rawStore) {
-            const matched = tryMatchStoreName(rawStore);
-            if (matched && matched !== 'GM Fashions Warehouse') {
-              rowStore = matched;
-            } else if (matched) {
-              candidateWarehouse = matched;
-            }
-          }
-        }
-
-        // 5. Use sheet-level / pre-header / file-level detected store ONLY IF IT IS A RETAIL STORE
-        if (!rowStore && sheetLevelStore && sheetLevelStore !== 'GM Fashions Warehouse') {
-          rowStore = sheetLevelStore;
-        }
-
-        // 6. If headers had a single store column (e.g. KOOTTAPPALLI)
-        if (!rowStore && retailStoreCols.length === 1) {
-          rowStore = retailStoreCols[0].store;
-        }
-
-        // 7. If row had a candidate warehouse and no retail store found
-        if (!rowStore && candidateWarehouse) {
-          rowStore = candidateWarehouse;
-        }
-
-        // 8. Fallback to Koottappalli
-        if (!rowStore) {
-          rowStore = 'Kootapalli';
-        }
-
-        const storeDisplay = formatStoreDisplayName(rowStore);
-
-        items.push({
-          id: `sales_${sheetName}_${r}_${items.length}`,
-          toonLabel,
-          colour,
-          size,
-          productName,
-          brand,
-          ean,
-          store: rowStore,
-          salesQty,
-          mrp,
-          billNo,
-          date,
-          storeBreakdown: { [storeDisplay]: salesQty },
-        });
       }
     }
   }
@@ -712,9 +762,22 @@ export async function parseSalesExcelFile(
     );
   }
 
-  // Calculate and attach complete store breakdown for each unique item/EAN
+  if (onProgress) {
+    onProgress({
+      percent: 96,
+      loadedBytes: file.size,
+      totalBytes: file.size,
+      rowsParsed: items.length,
+      stage: 'Aggregating store sales breakdowns...',
+    });
+  }
+  await yieldToMainThread();
+
   const unifiedItems = calculateTotalSalesQuantities(items);
-  const totalSalesUnits = unifiedItems.reduce((sum, item) => sum + (Number(item.salesQty) || 0), 0);
+  let totalSalesUnits = 0;
+  for (let i = 0; i < unifiedItems.length; i++) {
+    totalSalesUnits += Number(unifiedItems[i].salesQty) || 0;
+  }
 
   const fileInfo: UploadedFileInfo = {
     fileName: file.name,
@@ -727,23 +790,31 @@ export async function parseSalesExcelFile(
     detectedQuantityColumn: detectedQtyColName,
   };
 
+  if (onProgress) {
+    onProgress({
+      percent: 100,
+      loadedBytes: file.size,
+      totalBytes: file.size,
+      rowsParsed: unifiedItems.length,
+      stage: 'Completed',
+    });
+  }
+
   return { items: unifiedItems, fileInfo };
 }
 
 /**
- * Calculates and attaches complete storeBreakdown across all stores for each unique item/EAN in sales data
+ * Calculates and attaches complete storeBreakdown across all stores for each unique item/EAN in sales data.
+ * Mutates items in-place to avoid doubling RAM usage on massive datasets.
  */
 export function calculateTotalSalesQuantities(items: MappedSalesItem[]): MappedSalesItem[] {
-  const totalsMap = new Map<string, number>();
   const storeBreakdownsMap = new Map<string, Record<string, number>>();
 
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const key = item.ean && item.ean.trim()
       ? item.ean.trim()
       : `${(item.colour || '').trim()}__${(item.toonLabel || '').trim()}__${(item.size || '').trim()}`.toLowerCase();
-
-    const curr = totalsMap.get(key) || 0;
-    totalsMap.set(key, curr + (Number(item.salesQty) || 0));
 
     let bd = storeBreakdownsMap.get(key);
     if (!bd) {
@@ -764,22 +835,20 @@ export function calculateTotalSalesQuantities(items: MappedSalesItem[]): MappedS
     bd[sDisplay] = (bd[sDisplay] || 0) + (Number(item.salesQty) || 0);
   }
 
-  return items.map((item) => {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const key = item.ean && item.ean.trim()
       ? item.ean.trim()
       : `${(item.colour || '').trim()}__${(item.toonLabel || '').trim()}__${(item.size || '').trim()}`.toLowerCase();
 
-    const bd = storeBreakdownsMap.get(key) || {
+    item.storeBreakdown = storeBreakdownsMap.get(key) || {
       [formatStoreDisplayName(item.store)]: Number(item.salesQty) || 0,
       'KOOTTAPPALLI': 0,
       'GM FASHIONS WAREHOUSE': 0,
     };
+  }
 
-    return {
-      ...item,
-      storeBreakdown: bd,
-    };
-  });
+  return items;
 }
 
 /**

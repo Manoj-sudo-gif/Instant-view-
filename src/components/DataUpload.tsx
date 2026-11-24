@@ -9,8 +9,10 @@ import {
 } from 'lucide-react';
 import { UploadedFileInfo, MappedInventoryItem } from '../types/inventory';
 import {
-  parseExcelFile,
+  parseInventoryFile,
 } from '../utils/excelParser';
+import { formatByteSize, requestHighCapacityStorage } from '../utils/storage';
+import { ParseProgress } from '../utils/streamingCsvParser';
 
 interface DataUploadProps {
   onDataLoaded: (items: MappedInventoryItem[], fileInfo: UploadedFileInfo) => void;
@@ -25,40 +27,56 @@ export function DataUpload({
 }: DataUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [parseProgress, setParseProgress] = useState<ParseProgress | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const processFile = async (file: File) => {
     setErrorMessage(null);
     setIsProcessing(true);
+    setParseProgress({
+      percent: 5,
+      loadedBytes: 0,
+      totalBytes: file.size,
+      rowsParsed: 0,
+      stage: 'Preparing 1 GB high-capacity cache...',
+    });
 
     try {
+      const lowerName = file.name.toLowerCase();
       if (
-        !file.name.endsWith('.xlsx') &&
-        !file.name.endsWith('.xls') &&
-        !file.name.endsWith('.csv')
+        !lowerName.endsWith('.xlsx') &&
+        !lowerName.endsWith('.xls') &&
+        !lowerName.endsWith('.csv')
       ) {
         throw new Error(
           'Unsupported file format. Please upload an Excel (.xlsx, .xls) or .csv file generated from Wondersoft.'
         );
       }
 
-      const buffer = await file.arrayBuffer();
-      const mappedItems = await parseExcelFile(buffer);
+      await requestHighCapacityStorage();
+      const mappedItems = await parseInventoryFile(file, (progress) => {
+        setParseProgress(progress);
+      });
 
       if (mappedItems.length === 0) {
         throw new Error('No valid inventory records found in the uploaded file.');
       }
 
-      const uniqueEans = new Set(mappedItems.map((i) => i.ean).filter(Boolean)).size;
-      const uniqueToons = new Set(mappedItems.map((i) => i.toonLabel).filter(Boolean)).size;
+      const eanSet = new Set<string>();
+      const toonSet = new Set<string>();
+      for (let i = 0; i < mappedItems.length; i++) {
+        const item = mappedItems[i];
+        if (item.ean) eanSet.add(item.ean);
+        if (item.toonLabel) toonSet.add(item.toonLabel);
+      }
 
       const info: UploadedFileInfo = {
         fileName: file.name,
         fileSize: file.size,
         totalRows: mappedItems.length,
-        uniqueEANs: uniqueEans,
-        uniqueToonLabels: uniqueToons,
+        uniqueEANs: eanSet.size,
+        uniqueToonLabels: toonSet.size,
         uploadedAt: new Date().toLocaleTimeString(),
       };
 
@@ -70,6 +88,7 @@ export function DataUpload({
       );
     } finally {
       setIsProcessing(false);
+      setParseProgress(null);
     }
   };
 
@@ -149,6 +168,8 @@ export function DataUpload({
                 <span>•</span>
                 <span>Toon Styles: <strong>{fileInfo.uniqueToonLabels}</strong></span>
                 <span>•</span>
+                <span>Size: <strong>{formatByteSize(fileInfo.fileSize)}</strong></span>
+                <span>•</span>
                 <span>Uploaded at: {fileInfo.uploadedAt}</span>
               </div>
             </div>
@@ -211,12 +232,21 @@ export function DataUpload({
               <div>
                 <p className="text-sm sm:text-base font-semibold text-slate-800">
                   {isProcessing
-                    ? 'Parsing Wondersoft inventory data...'
+                    ? parseProgress?.stage || 'Parsing Wondersoft inventory data...'
                     : 'Click to select or drag & drop Wondersoft Excel file'}
                 </p>
                 <p className="text-xs text-slate-500 mt-1">
-                  Supports .xlsx, .xls, and .csv files exported from Wondersoft POS
+                  {isProcessing && parseProgress
+                    ? `${parseProgress.percent}% • ${parseProgress.rowsParsed.toLocaleString()} rows processed (${formatByteSize(parseProgress.totalBytes)})`
+                    : 'Supports .xlsx, .xls, and .csv files up to 1 GB exported from Wondersoft POS'}
                 </p>
+                {isProcessing && parseProgress && (
+                  <progress
+                    value={Math.min(100, Math.max(4, parseProgress.percent))}
+                    max={100}
+                    className="w-full max-w-xs mx-auto mt-2.5 h-2 rounded-full overflow-hidden block appearance-none [&::-webkit-progress-bar]:bg-slate-200 [&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-value]:bg-indigo-600 [&::-webkit-progress-value]:rounded-full [&::-webkit-progress-value]:transition-all [&::-moz-progress-bar]:bg-indigo-600"
+                  />
+                )}
               </div>
 
               <div className="pt-2">

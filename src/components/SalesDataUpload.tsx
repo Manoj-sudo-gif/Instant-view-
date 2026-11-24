@@ -10,6 +10,8 @@ import {
 } from 'lucide-react';
 import { UploadedFileInfo, MappedSalesItem } from '../types/inventory';
 import { parseSalesExcelFile } from '../utils/salesParser';
+import { formatByteSize, requestHighCapacityStorage } from '../utils/storage';
+import { ParseProgress } from '../utils/streamingCsvParser';
 
 interface SalesDataUploadProps {
   onDataLoaded: (items: MappedSalesItem[], fileInfo: UploadedFileInfo) => void;
@@ -24,25 +26,37 @@ export function SalesDataUpload({
 }: SalesDataUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [parseProgress, setParseProgress] = useState<ParseProgress | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const processFile = async (file: File) => {
     setErrorMessage(null);
     setIsProcessing(true);
+    setParseProgress({
+      percent: 5,
+      loadedBytes: 0,
+      totalBytes: file.size,
+      rowsParsed: 0,
+      stage: 'Preparing 1 GB high-capacity cache...',
+    });
 
     try {
+      const lowerName = file.name.toLowerCase();
       if (
-        !file.name.endsWith('.xlsx') &&
-        !file.name.endsWith('.xls') &&
-        !file.name.endsWith('.csv')
+        !lowerName.endsWith('.xlsx') &&
+        !lowerName.endsWith('.xls') &&
+        !lowerName.endsWith('.csv')
       ) {
         throw new Error(
           'Unsupported file format. Please upload a Sales Excel (.xlsx, .xls) or .csv file exported from Wondersoft POS.'
         );
       }
 
-      const { items, fileInfo: info } = await parseSalesExcelFile(file);
+      await requestHighCapacityStorage();
+      const { items, fileInfo: info } = await parseSalesExcelFile(file, (progress) => {
+        setParseProgress(progress);
+      });
 
       if (items.length === 0) {
         throw new Error('No valid sales records found in the uploaded file.');
@@ -56,6 +70,7 @@ export function SalesDataUpload({
       );
     } finally {
       setIsProcessing(false);
+      setParseProgress(null);
     }
   };
 
@@ -154,6 +169,8 @@ export function SalesDataUpload({
                   </>
                 )}
                 <span>•</span>
+                <span>Size: <strong>{formatByteSize(fileInfo.fileSize)}</strong></span>
+                <span>•</span>
                 <span className="text-slate-500 font-mono">
                   {fileInfo.uploadedAt}
                 </span>
@@ -220,15 +237,24 @@ export function SalesDataUpload({
               )}
             </div>
 
-            <div className="space-y-1">
+            <div className="space-y-1 w-full max-w-sm mx-auto">
               <p className="text-sm font-semibold text-slate-800">
                 {isProcessing
-                  ? 'Processing and validating sales records...'
+                  ? parseProgress?.stage || 'Processing and validating sales records...'
                   : 'Drop your Wondersoft Sales Report Excel file here'}
               </p>
-              <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                Supports Excel (.xlsx, .xls) and CSV sales exports with Toon Label and Quantity columns.
+              <p className="text-xs text-slate-500">
+                {isProcessing && parseProgress
+                  ? `${parseProgress.percent}% • ${parseProgress.rowsParsed.toLocaleString()} rows processed (${formatByteSize(parseProgress.totalBytes)})`
+                  : 'Supports Excel (.xlsx, .xls) and CSV sales exports up to 1 GB with Toon Label and Quantity columns.'}
               </p>
+              {isProcessing && parseProgress && (
+                <progress
+                  value={Math.min(100, Math.max(4, parseProgress.percent))}
+                  max={100}
+                  className="w-full mt-2 h-2 rounded-full overflow-hidden block appearance-none [&::-webkit-progress-bar]:bg-slate-200 [&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-value]:bg-indigo-600 [&::-webkit-progress-value]:rounded-full [&::-webkit-progress-value]:transition-all [&::-moz-progress-bar]:bg-indigo-600"
+                />
+              )}
             </div>
 
             <button

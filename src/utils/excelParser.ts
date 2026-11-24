@@ -20,6 +20,12 @@ import {
   STORE_SHORTCUTS,
 } from './stockShuffle';
 import { SAMPLE_WONDERSOFT_DATA } from './sampleData';
+import { MAX_FILE_UPLOAD_BYTES, formatByteSize } from './storage';
+import {
+  ParseProgress,
+  streamCsvFileInBatches,
+  yieldToMainThread,
+} from './streamingCsvParser';
 
 /**
  * Normalizes header keys by lowercasing and stripping all non-alphanumeric chars
@@ -198,13 +204,72 @@ export function matchStoreName(rawStore: string, fallback: StoreName = 'Kootapal
 }
 
 /**
- * Detects the real header row index in a worksheet.
+ * Detects the real header row index from a 2D array of rows (works for streaming CSV or dense sheets).
+ */
+export function findHeaderRowIndexFromRows(rows: unknown[][]): number {
+  const maxSearch = Math.min(rows.length - 1, 30);
+  let bestRow = 0;
+  let bestScore = 0;
+
+  const keywordCategories = [
+    ['ean', 'barcode', 'upc', 'gtin', 'sku', 'bcode'],
+    ['productgroup', 'productgrp', 'prodgroup', 'producttype', 'group', 'category'],
+    ['department', 'dept', 'itemname', 'productname', 'description'],
+    ['class', 'subclass', 'brand'],
+    ['color', 'colour', 'shade'],
+    ['size', 'itemsize'],
+    ['garment', 'garments', 'fabric', 'material'],
+    ['mrp', 'price', 'rate', 'salerate', 'rsp'],
+    ['stock', 'qty', 'quantity', 'closingstock', 'balqty', 'totalqty'],
+    ['toon', 'style', 'styleno', 'itemcode', 'design'],
+    ['store', 'branch', 'outlet', 'location', 'salem', 'karur', 'mallur', 'namakkal', 'kumbakonam', 'kootapalli', 'koottappalli', 'koottapalli', 'koot', 'warehouse', 'thiruvannamalai']
+  ];
+
+  for (let r = 0; r <= maxSearch; r++) {
+    const row = rows[r];
+    if (!row || !Array.isArray(row)) continue;
+
+    let nonBlankCount = 0;
+    const cellValues: string[] = [];
+
+    for (let c = 0; c < row.length; c++) {
+      const v = row[c];
+      if (v !== undefined && v !== null && String(v).trim() !== '') {
+        nonBlankCount++;
+        cellValues.push(String(v).toLowerCase().replace(/[^a-z0-9]/g, ''));
+      }
+    }
+
+    if (nonBlankCount < 3) continue;
+
+    let rowScore = 0;
+    for (const group of keywordCategories) {
+      if (cellValues.some((val) => group.some((kw) => val.includes(kw)))) {
+        rowScore += 3;
+      }
+    }
+
+    if (cellValues.some((val) => val.includes('ean') || val.includes('barcode'))) {
+      rowScore += 8;
+    }
+
+    if (rowScore > bestScore) {
+      bestScore = rowScore;
+      bestRow = r;
+    }
+  }
+
+  return bestScore >= 6 ? bestRow : 0;
+}
+
+/**
+ * Detects the real header row index in a worksheet (supports both standard and dense SheetJS modes).
  * In many real Wondersoft/ERP exports, rows 0-4 contain company titles, dates, or branch names.
- * This scans all candidates and picks the row with the strongest multi-column match.
  */
 export function findHeaderRowIndex(worksheet: XLSX.WorkSheet): number {
   const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1:Z100');
   const maxSearch = Math.min(range.e.r, 30);
+  const denseWs = worksheet as unknown as Record<number, (XLSX.CellObject | undefined)[] | undefined>;
 
   let bestRow = 0;
   let bestScore = 0;
@@ -212,10 +277,10 @@ export function findHeaderRowIndex(worksheet: XLSX.WorkSheet): number {
   for (let r = range.s.r; r <= maxSearch; r++) {
     let nonBlankCount = 0;
     const cellValues: string[] = [];
+    const denseRow = denseWs[r];
 
     for (let c = range.s.c; c <= range.e.c; c++) {
-      const cellAddress = XLSX.utils.encode_cell({ r, c });
-      const cell = worksheet[cellAddress];
+      const cell = denseRow ? denseRow[c] : worksheet[XLSX.utils.encode_cell({ r, c })];
       if (cell && cell.v !== undefined && cell.v !== null && String(cell.v).trim() !== '') {
         nonBlankCount++;
         cellValues.push(String(cell.v).toLowerCase().replace(/[^a-z0-9]/g, ''));
@@ -385,18 +450,19 @@ export function findStoreColumnsInRow(
 }
 
 /**
- * Calculates and attaches totalQuantity and storeBreakdown across all stores for each unique item/EAN
+ * Calculates and attaches totalQuantity and storeBreakdown across all stores for each unique item/EAN.
+ * Mutates items in-place and shares storeBreakdown references to keep RAM usage minimal for 1 GB uploads.
  */
 export function calculateTotalQuantities(items: MappedInventoryItem[]): MappedInventoryItem[] {
-  // Group sum and store-wise quantity map by EAN or composite key
   const totalsMap = new Map<string, number>();
   const storeBreakdownsMap = new Map<string, Record<string, number>>();
 
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const key = item.ean
       ? item.ean.trim()
       : `${item.department}|${item.productName}|${item.colour}|${item.size}|${item.toonLabel}`.toLowerCase();
-    
+
     const curr = totalsMap.get(key) || 0;
     totalsMap.set(key, curr + (item.stockQuantity || 0));
 
@@ -418,17 +484,17 @@ export function calculateTotalQuantities(items: MappedInventoryItem[]): MappedIn
       bd[sDisplay] = (bd[sDisplay] || 0) + (item.stockQuantity || 0);
     }
 
-    // Ensure GM FASHIONS WAREHOUSE is tracked (at least 0) in the breakdown for every product
     if (bd['GM FASHIONS WAREHOUSE'] === undefined) {
       bd['GM FASHIONS WAREHOUSE'] = 0;
     }
   }
 
-  return items.map((item) => {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const key = item.ean
       ? item.ean.trim()
       : `${item.department}|${item.productName}|${item.colour}|${item.size}|${item.toonLabel}`.toLowerCase();
-    
+
     const breakdown = storeBreakdownsMap.get(key) || {
       [formatStoreDisplayName(item.store)]: item.stockQuantity || 0,
       'GM FASHIONS WAREHOUSE': 0,
@@ -438,12 +504,11 @@ export function calculateTotalQuantities(items: MappedInventoryItem[]): MappedIn
       breakdown['GM FASHIONS WAREHOUSE'] = 0;
     }
 
-    return {
-      ...item,
-      totalQuantity: totalsMap.get(key) || item.stockQuantity || 0,
-      storeBreakdown: breakdown,
-    };
-  });
+    item.totalQuantity = totalsMap.get(key) || item.stockQuantity || 0;
+    item.storeBreakdown = breakdown;
+  }
+
+  return items;
 }
 
 /**
@@ -748,51 +813,507 @@ export function mapWondersoftRow(
   ];
 }
 
+interface StockColumnLayout {
+  deptIdx: number;
+  prodIdx: number;
+  brandIdx: number;
+  colourIdx: number;
+  sizeIdx: number;
+  fabricIdx: number;
+  eanIdx: number;
+  eanFallbackIndices: number[];
+  codeFallbackIndices: number[];
+  mrpIdx: number;
+  toonIdx: number;
+  itemCodeIdx: number;
+  branchIdx: number;
+  storeIdx: number;
+  stockIdx: number;
+  totalQtyIdx: number;
+  wideStores: { colIndex: number; store: StoreName; displayName: string }[];
+}
+
+function buildStockColumnLayout(headers: string[]): StockColumnLayout {
+  const normToIdx = new Map<string, number>();
+  headers.forEach((h, idx) => {
+    const norm = normalizeKey(String(h || ''));
+    if (norm && !normToIdx.has(norm)) {
+      normToIdx.set(norm, idx);
+    }
+  });
+
+  const findFirst = (keys: string[]): number => {
+    for (const k of keys) {
+      const idx = normToIdx.get(k);
+      if (idx !== undefined) return idx;
+    }
+    return -1;
+  };
+
+  const eanFallbackIndices: number[] = [];
+  const codeFallbackIndices: number[] = [];
+  headers.forEach((h, idx) => {
+    const k = normalizeKey(String(h || ''));
+    if (!k) return;
+    if (k.includes('ean') || k.includes('barcode') || k.includes('bcode') || k.includes('upc') || k.includes('gtin')) {
+      eanFallbackIndices.push(idx);
+    }
+    if (
+      k.includes('itemcode') ||
+      k.includes('itemno') ||
+      k.includes('prodcode') ||
+      k.includes('productcode') ||
+      k.includes('code') ||
+      k.includes('sku') ||
+      k.includes('plu') ||
+      k.includes('artcode')
+    ) {
+      codeFallbackIndices.push(idx);
+    }
+  });
+
+  const wideStores: { colIndex: number; store: StoreName; displayName: string }[] = [];
+  const seenStoreNorms = new Set<string>();
+  headers.forEach((h, idx) => {
+    const norm = normalizeKey(String(h || ''));
+    if (!norm || seenStoreNorms.has(norm)) return;
+    if (
+      norm.includes('product') ||
+      norm.includes('dept') ||
+      norm.includes('class') ||
+      norm.includes('brand') ||
+      norm.includes('color') ||
+      norm.includes('colour') ||
+      norm.includes('size') ||
+      norm.includes('garment') ||
+      norm.includes('fabric') ||
+      norm.includes('ean') ||
+      norm.includes('barcode') ||
+      norm.includes('mrp') ||
+      norm.includes('price') ||
+      norm.includes('rate') ||
+      norm.includes('toon') ||
+      norm.includes('style') ||
+      norm.includes('image') ||
+      norm === 'total' ||
+      norm === 'totalqty' ||
+      norm === 'totalstock' ||
+      norm === 'totalquantity'
+    ) {
+      return;
+    }
+
+    if (
+      norm.includes('koot') ||
+      norm.includes('kooth') ||
+      norm.includes('koott') ||
+      norm.includes('kuttap') ||
+      norm.includes('kootam') ||
+      norm.includes('koottam') ||
+      norm.startsWith('ktp') ||
+      norm.includes('ktp')
+    ) {
+      wideStores.push({ colIndex: idx, store: 'Kootapalli', displayName: 'KOOTTAPPALLI' });
+      seenStoreNorms.add(norm);
+    } else if (norm.includes('kumba') || norm.includes('kumbakonam') || norm.includes('kmb')) {
+      wideStores.push({ colIndex: idx, store: 'Kumbakonam', displayName: 'KUMBAKONAM' });
+      seenStoreNorms.add(norm);
+    } else if (norm.includes('mallur') || norm.includes('mlr')) {
+      wideStores.push({ colIndex: idx, store: 'Mallur', displayName: 'MALLUR' });
+      seenStoreNorms.add(norm);
+    } else if (norm.includes('namakkal') || norm.includes('namakal') || norm.includes('nmkl')) {
+      wideStores.push({ colIndex: idx, store: 'Namakkal', displayName: 'NAMAKKAL' });
+      seenStoreNorms.add(norm);
+    } else if (norm.includes('salem') || norm.includes('slm')) {
+      wideStores.push({ colIndex: idx, store: 'Salem', displayName: 'SALEM' });
+      seenStoreNorms.add(norm);
+    } else if (norm.includes('tiruvan') || norm.includes('thiruvan') || norm.includes('tvm') || norm.includes('thiruvanna')) {
+      wideStores.push({ colIndex: idx, store: 'Thiruvannamalai', displayName: 'TIRUVANNAMALAI' });
+      seenStoreNorms.add(norm);
+    } else if (norm.includes('karur') || norm.includes('krr')) {
+      wideStores.push({ colIndex: idx, store: 'Karur', displayName: 'KARUR' });
+      seenStoreNorms.add(norm);
+    } else if (
+      norm.includes('ware') ||
+      norm === 'wh' ||
+      norm.includes('godown') ||
+      norm.includes('central') ||
+      norm.includes('gmfashionswarehouse')
+    ) {
+      wideStores.push({ colIndex: idx, store: 'GM Fashions Warehouse', displayName: 'GM FASHIONS WAREHOUSE' });
+      seenStoreNorms.add(norm);
+    }
+  });
+
+  return {
+    deptIdx: findFirst(['productgroup', 'productgrp', 'prodgroup', 'group', 'producttype', 'category', 'pg']),
+    prodIdx: findFirst(['department', 'dept', 'productname', 'itemname', 'itemdescription', 'description', 'desc', 'product']),
+    brandIdx: findFirst(['class', 'brand', 'brandname', 'subclass', 'categoryclass']),
+    colourIdx: findFirst(['color', 'colour', 'shade', 'colorname', 'colourname']),
+    sizeIdx: findFirst(['size', 'itemsize', 'sizedesc']),
+    fabricIdx: findFirst(['garments', 'garment', 'fabric', 'material', 'fabrictype', 'garmenttype']),
+    eanIdx: findFirst(['eancode', 'ean', 'eanno', 'eannumber', 'barcode', 'barcodeno', 'itembarcode', 'eanbarcode', 'barcodeean', 'barcodenumber', 'upc', 'gtin']),
+    eanFallbackIndices,
+    codeFallbackIndices,
+    mrpIdx: findFirst(['mrp', 'sellingprice', 'price', 'rate', 'salerate', 'rsp']),
+    toonIdx: findFirst(['toonlabel', 'toonlable', 'toollabel', 'toollable', 'toon', 'toonno', 'tooncode', 'style', 'styleno', 'stylecode', 'stylename', 'design', 'designno', 'artno', 'articleno', 'subgroup']),
+    itemCodeIdx: findFirst(['itemcode', 'itemno']),
+    branchIdx: findFirst(['branch', 'branchname', 'location', 'outlet', 'site', 'shop', 'counter']),
+    storeIdx: findFirst(['store', 'storename', 'company']),
+    stockIdx: findFirst(['stock', 'stockquantity', 'stockqty', 'qty', 'quantity', 'closingstock', 'balqty', 'balanceqty', 'currentstock', 'availableqty']),
+    totalQtyIdx: findFirst(['totalquantity', 'totalqty', 'totalstock', 'total']),
+    wideStores,
+  };
+}
+
+function mapStockArrayRow(
+  row: unknown[],
+  layout: StockColumnLayout,
+  index: number,
+  out: MappedInventoryItem[]
+): void {
+  if (!row || row.length === 0) return;
+  let hasContent = false;
+  for (let i = 0; i < row.length; i++) {
+    const v = row[i];
+    if (v !== '' && v !== null && v !== undefined) {
+      hasContent = true;
+      break;
+    }
+  }
+  if (!hasContent) return;
+
+  const strAt = (idx: number, fallback: string): string => {
+    if (idx < 0 || idx >= row.length) return fallback;
+    const v = row[idx];
+    if (v === null || v === undefined || v === '') return fallback;
+    const s = String(v).trim();
+    return s || fallback;
+  };
+
+  const department = strAt(layout.deptIdx, 'Apparel');
+  const productName = strAt(layout.prodIdx, 'Fashion Wear');
+  const brand = strAt(layout.brandIdx, 'GM Fashions');
+  const colour = strAt(layout.colourIdx, 'Standard');
+  const size = strAt(layout.sizeIdx, 'Free');
+  const fabric = strAt(layout.fabricIdx, 'Cotton');
+
+  let rawEanVal: unknown = layout.eanIdx >= 0 ? row[layout.eanIdx] : '';
+  if (rawEanVal === undefined || rawEanVal === null || rawEanVal === '') {
+    for (const idx of layout.eanFallbackIndices) {
+      const v = row[idx];
+      if (v !== undefined && v !== null && v !== '') {
+        rawEanVal = v;
+        break;
+      }
+    }
+  }
+  if (rawEanVal === undefined || rawEanVal === null || rawEanVal === '') {
+    for (const idx of layout.codeFallbackIndices) {
+      const v = row[idx];
+      if (v !== undefined && v !== null) {
+        const cleaned = String(v).trim().replace(/[^0-9]/g, '');
+        if (cleaned.length >= 8 && cleaned.length <= 18) {
+          rawEanVal = v;
+          break;
+        }
+      }
+    }
+  }
+
+  const ean = cleanEanString(rawEanVal);
+  const sellingPrice = layout.mrpIdx >= 0 ? cleanNumber(row[layout.mrpIdx], 0) : 0;
+
+  let toonLabel = strAt(layout.toonIdx, '');
+  if (!toonLabel && layout.itemCodeIdx >= 0) {
+    const rawItemCode = strAt(layout.itemCodeIdx, '');
+    if (rawItemCode && rawItemCode !== String(rawEanVal || '').trim()) {
+      toonLabel = rawItemCode;
+    }
+  }
+
+  if (layout.wideStores.length >= 2) {
+    let sumQty = 0;
+    const breakdownObj: Record<string, number> = {};
+    for (const sc of layout.wideStores) {
+      const q = cleanNumber(row[sc.colIndex], 0);
+      breakdownObj[sc.displayName] = q;
+      sumQty += q;
+    }
+    const totalRowQty =
+      layout.totalQtyIdx >= 0 ? cleanNumber(row[layout.totalQtyIdx], sumQty) : sumQty;
+
+    let pushedAny = false;
+    for (let sIdx = 0; sIdx < layout.wideStores.length; sIdx++) {
+      const sc = layout.wideStores[sIdx];
+      const q = breakdownObj[sc.displayName];
+      if (q > 0) {
+        pushedAny = true;
+        out.push({
+          id: `item-${index}-${sIdx}-${ean || index}`,
+          department,
+          productName,
+          brand,
+          colour,
+          size,
+          fabric,
+          ean,
+          sellingPrice,
+          stockQuantity: q,
+          totalQuantity: totalRowQty,
+          store: sc.store,
+          toonLabel,
+          storeBreakdown: breakdownObj,
+        });
+      }
+    }
+    if (!pushedAny) {
+      out.push({
+        id: `item-${index}-0-${ean || index}`,
+        department,
+        productName,
+        brand,
+        colour,
+        size,
+        fabric,
+        ean,
+        sellingPrice,
+        stockQuantity: 0,
+        totalQuantity: totalRowQty,
+        store: 'GM Fashions Warehouse',
+        toonLabel,
+        storeBreakdown: breakdownObj,
+      });
+    }
+    return;
+  }
+
+  const branchCandidate = strAt(layout.branchIdx, '');
+  const storeCandidate = strAt(layout.storeIdx, '');
+  let store: StoreName;
+  const matchedBranch = branchCandidate ? tryMatchStoreName(branchCandidate) : null;
+  const matchedStore = storeCandidate ? tryMatchStoreName(storeCandidate) : null;
+
+  if (matchedBranch && matchedBranch !== 'GM Fashions Warehouse') {
+    store = matchedBranch;
+  } else if (matchedStore && matchedStore !== 'GM Fashions Warehouse') {
+    store = matchedStore;
+  } else if (matchedBranch) {
+    store = matchedBranch;
+  } else if (matchedStore) {
+    store = matchedStore;
+  } else {
+    store = matchStoreName(branchCandidate || storeCandidate || 'Kootapalli');
+  }
+
+  const stockQuantity = layout.stockIdx >= 0 ? cleanNumber(row[layout.stockIdx], 0) : 0;
+  const rawTotalQty =
+    layout.totalQtyIdx >= 0 ? cleanNumber(row[layout.totalQtyIdx], stockQuantity) : stockQuantity;
+
+  out.push({
+    id: `item-${index}-${ean || index}`,
+    department,
+    productName,
+    brand,
+    colour,
+    size,
+    fabric,
+    ean,
+    sellingPrice,
+    stockQuantity,
+    totalQuantity: rawTotalQty,
+    store,
+    toonLabel,
+  });
+}
+
 /**
- * Parses an Excel or CSV file (ArrayBuffer) into MappedInventoryItem[]
+ * High-capacity parser supporting Stock Reports up to 1 GB (.csv streamed in 4 MB chunks, .xlsx/.xls via dense SheetJS mode).
+ */
+export async function parseInventoryFile(
+  file: File,
+  onProgress?: (progress: ParseProgress) => void
+): Promise<MappedInventoryItem[]> {
+  if (file.size > MAX_FILE_UPLOAD_BYTES) {
+    throw new Error(
+      `File size (${formatByteSize(file.size)}) exceeds the 1 GB (${formatByteSize(MAX_FILE_UPLOAD_BYTES)}) maximum limit.`
+    );
+  }
+
+  const lowerName = file.name.toLowerCase();
+
+  // Streaming chunked path for CSV files (supports up to 1 GB with minimal memory footprint)
+  if (lowerName.endsWith('.csv')) {
+    const allItems: MappedInventoryItem[] = [];
+    const headerScanBuffer: string[][] = [];
+    let layout: StockColumnLayout | null = null;
+    let rowCounter = 0;
+
+    await streamCsvFileInBatches(
+      file,
+      (batch) => {
+        if (!layout) {
+          for (let i = 0; i < batch.length; i++) {
+            headerScanBuffer.push(batch[i]);
+          }
+          if (headerScanBuffer.length >= 2) {
+            const headerIdx = findHeaderRowIndexFromRows(headerScanBuffer);
+            const headers = (headerScanBuffer[headerIdx] || []).map((h) => String(h || '').trim());
+            layout = buildStockColumnLayout(headers);
+            for (let r = headerIdx + 1; r < headerScanBuffer.length; r++) {
+              mapStockArrayRow(headerScanBuffer[r], layout, rowCounter++, allItems);
+            }
+            headerScanBuffer.length = 0;
+          }
+        } else {
+          for (let i = 0; i < batch.length; i++) {
+            mapStockArrayRow(batch[i], layout, rowCounter++, allItems);
+          }
+        }
+      },
+      onProgress
+    );
+
+    if (allItems.length === 0) {
+      throw new Error('The CSV file is empty. No valid inventory rows found.');
+    }
+
+    if (onProgress) {
+      onProgress({
+        percent: 96,
+        loadedBytes: file.size,
+        totalBytes: file.size,
+        rowsParsed: allItems.length,
+        stage: 'Indexing store quantities...',
+      });
+    }
+    await yieldToMainThread();
+
+    const result = calculateTotalQuantities(allItems);
+    if (onProgress) {
+      onProgress({
+        percent: 100,
+        loadedBytes: file.size,
+        totalBytes: file.size,
+        rowsParsed: result.length,
+        stage: 'Completed',
+      });
+    }
+    return result;
+  }
+
+  // Excel (.xlsx / .xls) path with dense memory-saving SheetJS options + batched processing
+  if (onProgress) {
+    onProgress({
+      percent: 15,
+      loadedBytes: 0,
+      totalBytes: file.size,
+      rowsParsed: 0,
+      stage: 'Reading workbook into memory...',
+    });
+  }
+
+  const buffer = await file.arrayBuffer();
+  const result = await parseExcelFile(buffer, (p) => {
+    if (onProgress) {
+      onProgress({ ...p, loadedBytes: file.size, totalBytes: file.size });
+    }
+  });
+  return result;
+}
+
+/**
+ * Parses an Excel or CSV file (ArrayBuffer) into MappedInventoryItem[] using dense low-memory SheetJS mode.
  */
 export async function parseExcelFile(
-  fileBuffer: ArrayBuffer
+  fileBuffer: ArrayBuffer,
+  onProgress?: (progress: ParseProgress) => void
 ): Promise<MappedInventoryItem[]> {
-  const workbook = XLSX.read(fileBuffer, { type: 'array', cellDates: true });
+  const workbook = XLSX.read(fileBuffer, {
+    type: 'array',
+    dense: true,
+    cellDates: true,
+    cellFormula: false,
+    cellHTML: false,
+    cellNF: false,
+    cellStyles: false,
+    cellText: false,
+  });
   if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
     throw new Error('The uploaded Excel file contains no worksheets.');
   }
 
-  // Scan sheets to find the worksheet with real inventory data
-  let targetWorksheet: XLSX.WorkSheet | null = null;
-  let targetHeaderRowIndex = 0;
-  let targetRawRows: Record<string, unknown>[] = [];
-
+  // Pick the largest sheet
+  let bestSheetName = '';
+  let bestRowEstimate = -1;
   for (const sheetName of workbook.SheetNames) {
     const ws = workbook.Sheets[sheetName];
     if (!ws || !ws['!ref']) continue;
-
-    const headerIdx = findHeaderRowIndex(ws);
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, {
-      range: headerIdx,
-      defval: '',
-    });
-
-    if (rows && rows.length > targetRawRows.length) {
-      targetWorksheet = ws;
-      targetHeaderRowIndex = headerIdx;
-      targetRawRows = rows;
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    const est = range.e.r - range.s.r;
+    if (est > bestRowEstimate) {
+      bestRowEstimate = est;
+      bestSheetName = sheetName;
+    } else {
+      delete workbook.Sheets[sheetName];
     }
   }
 
-  if (!targetWorksheet || targetRawRows.length === 0) {
+  if (!bestSheetName) {
     throw new Error('The worksheet is empty. No inventory rows found.');
   }
 
-  // Map each row into items (handles both single-store and wide store columns)
-  const allItems: MappedInventoryItem[] = [];
-  targetRawRows.forEach((row, idx) => {
-    const items = mapWondersoftRow(row, idx);
-    allItems.push(...items);
+  const targetWs = workbook.Sheets[bestSheetName];
+  const headerIdx = findHeaderRowIndex(targetWs);
+  const rawRows = XLSX.utils.sheet_to_json<unknown[]>(targetWs, {
+    header: 1,
+    range: headerIdx,
+    defval: '',
   });
+  // Release SheetJS worksheet structure immediately for GC
+  delete workbook.Sheets[bestSheetName];
 
-  // Calculate accurate totalQuantity across all stores for each EAN / item
+  if (!rawRows || rawRows.length < 2) {
+    throw new Error('The worksheet is empty. No inventory rows found.');
+  }
+
+  const headers = (rawRows[0] || []).map((h) => String(h || '').trim());
+  const layout = buildStockColumnLayout(headers);
+  const allItems: MappedInventoryItem[] = [];
+  const totalDataRows = rawRows.length - 1;
+  const BATCH_SIZE = 10000;
+
+  for (let r = 1; r < rawRows.length; r++) {
+    mapStockArrayRow(rawRows[r], layout, r - 1, allItems);
+    if (r % BATCH_SIZE === 0) {
+      if (onProgress) {
+        onProgress({
+          percent: 30 + Math.round((r / totalDataRows) * 62),
+          loadedBytes: fileBuffer.byteLength,
+          totalBytes: fileBuffer.byteLength,
+          rowsParsed: allItems.length,
+          stage: `Mapping records (${allItems.length.toLocaleString()})...`,
+        });
+      }
+      await yieldToMainThread();
+    }
+  }
+
+  if (allItems.length === 0) {
+    throw new Error('The worksheet is empty. No inventory rows found.');
+  }
+
+  if (onProgress) {
+    onProgress({
+      percent: 95,
+      loadedBytes: fileBuffer.byteLength,
+      totalBytes: fileBuffer.byteLength,
+      rowsParsed: allItems.length,
+      stage: 'Indexing store quantities...',
+    });
+  }
+  await yieldToMainThread();
+
   return calculateTotalQuantities(allItems);
 }
 

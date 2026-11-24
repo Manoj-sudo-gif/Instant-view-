@@ -22,6 +22,8 @@ import {
   clearStorageSession,
   clearStockStorage,
   clearSalesStorage,
+  saveStockDataToStorage,
+  saveSalesDataToStorage,
   SalesSearchState,
 } from './utils/storage';
 import { CheckCircle2, AlertTriangle, ArrowLeft } from 'lucide-react';
@@ -84,7 +86,7 @@ export default function App() {
   }, [inventoryItems]);
 
   // Handle stock data upload completion:
-  // Kept in active React state for high-speed in-memory session; not permanently dumped into browser disk
+  // Kept in active React state + cached in 1 GB chunked IndexedDB session cache (cleared on reload)
   const handleDataLoaded = (items: MappedInventoryItem[], info: UploadedFileInfo) => {
     setInventoryItems(items);
     setFileInfo(info);
@@ -92,13 +94,15 @@ export default function App() {
     setSearchState(null);
     setSearchResults([]);
     setLastExportFilename(null);
+    void saveStockDataToStorage(items, info);
   };
 
   // Handle sales data upload completion:
-  // Kept in active React state for high-speed in-memory session; not permanently dumped into browser disk
+  // Kept in active React state + cached in 1 GB chunked IndexedDB session cache (cleared on reload)
   const handleSalesDataLoaded = (items: MappedSalesItem[], info: UploadedFileInfo) => {
     setSalesItems(items);
     setSalesFileInfo(info);
+    void saveSalesDataToStorage(items, info);
   };
 
   // Reset / Replace data (Clear full session for both)
